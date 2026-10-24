@@ -1074,6 +1074,97 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         act = F.silu(gate) * up
         return self._cached_linear("down", expert_id, act)
 
+    # -- P4-02: grouped M=1 decode path ---------------------------------------
+    def _grouped_mlp_decode(
+        self,
+        layer: "RoutedExperts",
+        x1: torch.Tensor,
+        topk_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Single-token routed MLP through the grouped kernels (zero host sync).
+
+        P4-02. Replaces the per-expert Python loop (3 launches *per projection*
+        * 8 experts = 72 launches/token/layer) with ONE grouped launch per
+        projection:
+
+        * gate+up: ``exl3_moe_grouped_gemv`` with ``nslots=2``,
+          ``x_unit_stride=0`` (all 16 units share the token row);
+        * SiLU-gated product in one device expression (``acts`` is the only
+          inter-launch buffer — activations, never weights);
+        * down: one grouped launch with ``nslots=1``,
+          ``x_unit_stride=Kdim`` (each unit consumes its own activation row).
+
+        Routing stays on the device end-to-end (``expert_ids`` is built from
+        ``topk_ids`` without a host read), so this path performs **zero**
+        host-device syncs — the two remaining ``.tolist()`` syncs of the P4-01
+        fast path disappear. Numerics are bit-for-bit equal to
+        ``_expert_mlp_cached`` (tests/test_grouped_gemv.py, 1920/1920
+        bit-exact), including the weighted fp32 reduction.
+
+        Returns ``None`` when the grouped op is unavailable for this layer's
+        K/codebook so callers can fall back to the eager loop.
+        """
+        import torch.nn.functional as F
+
+        ids = topk_ids.view(-1)
+        if ids.numel() == 0:
+            return None
+        if getattr(self, "_grouped_supported", None) is None:
+            try:
+                from . import ops
+
+                esimd = ops._get_esimd()
+                self._grouped_supported = bool(esimd) and bool(
+                    esimd.exl3_supported(self.K, self.cb)
+                )
+            except Exception:
+                self._grouped_supported = False
+        if not self._grouped_supported:
+            return None
+        try:
+            if ids.dtype != torch.int32:
+                ids = ids.to(torch.int32)
+            dev = x1.device
+            inter = self.intermediate_size_per_partition
+
+            # gate+up: units = (expert, slot) pairs, x shared (stride 0).
+            gu = torch.ops.exl3xpu_C.exl3_moe_grouped_gemv(
+                x1,
+                layer.w13_trellis,
+                layer.w13_suh,
+                layer.w13_svh,
+                ids.repeat_interleave(2),
+                self._shard_of_nb(dev, inter),
+                2,
+                inter,
+                self.K,
+                self.cb,
+                0,
+            )
+            # gated SiLU on the device, then down with per-unit input rows.
+            acts = (F.silu(gu[0::2]) * gu[1::2]).reshape(-1, inter).contiguous()
+            dn = torch.ops.exl3xpu_C.exl3_moe_grouped_gemv(
+                acts,
+                layer.w2_trellis,
+                layer.w2_suh,
+                layer.w2_svh,
+                ids,
+                self._shard_of_nb(dev, self.hidden_size),
+                1,
+                self.hidden_size,
+                self.K,
+                self.cb,
+                inter,
+            )
+        except Exception:
+            # One failure (unsupported K/codebook, shape guard) disables the
+            # grouped path for this layer; the eager loop below stays correct.
+            self._grouped_supported = False
+            return None
+        w = weights.view(-1).to(torch.float32).unsqueeze(1)
+        return (dn.squeeze(1).to(torch.float32) * w).sum(dim=0).to(x1.dtype)
+
     def _expert_mlp(
         self, layer: "RoutedExperts", expert_id: int, x: torch.Tensor
     ) -> torch.Tensor:
@@ -1159,7 +1250,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         tokens = x2.shape[0]
 
         if self._debug_capture is None and tokens == 1:
-            # --- P4-01 single-token (decode) fast path ----------------------
+            # --- P4-01/P4-02 single-token (decode) fast path ------------------
+            # P4-02 first: two grouped kernel launches for all top-k experts
+            # with zero host syncs (routing stays on the device). Falls back to
+            # the P4-01 loop when the grouped op is unavailable.
+            y = self._grouped_mlp_decode(layer, x2, topk_ids, weights)
+            if y is not None:
+                return y.reshape(x.shape)
             # One host sync for the routing decision; every expert handle is a
             # zero-copy cache view, so there are no further syncs.
             ids = topk_ids.view(-1).tolist()

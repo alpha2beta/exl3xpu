@@ -813,6 +813,9 @@ void exl3_set_target_threads_mb64(int64_t n) { g_target_threads_mb64 = (int)n; }
 void exl3_set_target_threads_mb16(int64_t n) { g_target_threads_mb16 = (int)n; }
 void exl3_set_vec_max_m(int64_t n) { g_vec_max_m = (int)n; }
 
+// P4-02 (new file): grouped M=1 decode GEMV across all active experts.
+#include "exl3_moe_gemv.sycl"
+
 TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_int8(int on) -> ()", &exl3_set_int8);
 #ifdef EXL3_DNNL
@@ -842,6 +845,8 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_fused(int on) -> ()", &exl3_set_fused);
     m.def("exl3_set_local(int n) -> ()", &exl3_set_local);
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
+    m.def("exl3_moe_grouped_gemv(Tensor x, Tensor tr_arena, Tensor suh_arena, Tensor svh_arena, Tensor expert_ids, Tensor shard, int nslots, int N, int K, int cb, int x_unit_stride) -> Tensor");
+    m.impl("exl3_moe_grouped_gemv", torch::kXPU, &exl3_moe_grouped_gemv);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
     m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);
 }

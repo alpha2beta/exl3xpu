@@ -1,0 +1,366 @@
+// ============================================================================
+// exl3_moe_gemv.sycl — P4-02: grouped M=1 decode GEMV for EXL3 routed experts
+// ----------------------------------------------------------------------------
+// Attribution
+//   Phase/Task : Phase 4 / P4-02 (Gate 4)
+//   Author     : EXL3 vLLM-MoE bring-up agent
+//   Date       : 2026-10-24
+//   Scope      : NEW FILE. Adds ONE grouped launch per projection across all
+//                active decode experts. exl3_esimd.h is NOT modified;
+//                exl3_ops.sycl only gains `#include "exl3_moe_gemv.sycl"` and
+//                one m.def/m.impl registration (dense launchers untouched).
+//
+// Why (P4-01 measurement — logs/moe-p4/phase4-dispatch-summary.json)
+//   Eager `apply` issues 3 launches *per projection* (HadIn + GEMV + HadOut).
+//   At single-token decode that is 8 experts x 3 projections x 3 = 72 launches
+//   per layer per token. HadOut alone measured 1309 us/token across 28 launches
+//   (47 us each) — launch latency, not math. Grouping every active expert into
+//   one launch removes N-1 of those overheads.
+//
+// Design
+//   * unit = (expert, projection-slot);  units = NE * nslots.
+//     slot = unit % nslots,  expert = expert_ids[unit] (repeated nslots times).
+//     For gate+up, nslots=2, so the arena [E, nslots, ...] is already a flat
+//     [units, ...] layout — no gather and no host sync.
+//   * x: `x_unit_stride == 0` → every unit consumes the SAME token
+//     (gate+up at M=1); `x_unit_stride == Kdim` → x[unit] (down, where each
+//     expert consumes its own SiLU(gate)*up activation).
+//   * dtype: templated on T = sycl::half | sycl::ext::oneapi::bfloat16 so the
+//     grouped path serves the real model (bf16 activations, Gate 2/3 numerics)
+//     as well as fp16 harness tests.
+//   * Each unit runs the existing *fused* micro-sequence
+//     input Hadamard -> split-K GEMV -> output Hadamard + SVH, reusing the
+//     shared helpers from exl3_esimd.h (load_words / planarize /
+//     GemvKernel::step).
+//
+// Bit-exact parity with the eager per-expert path (Gate 4 numerics)
+//   For K=3 (routed) the eager path takes the NON-fused branch of
+//   exl3_gemm_small: HadIn(TIn) -> GemvKernel<...,false> -> HadOut(TOut), with
+//   split-K geometry rps = (tk + P - 1)/P and g_target_threads=1024 giving
+//   rps = 1 for both gate/up (tk=128) and down (tk=32): each split owns ONE
+//   tile-row, so eager's part[p] is that row's fp32 lane-reduced contribution
+//   and HadOut sums p = 0..P-1 SEQUENTIALLY:
+//       v  = 0;
+//       for r in [0, tk): v += part[r][nb*128];   // fp32 chain, row order
+//       fwht128(v);
+//       v  = v * kRsqrt128 * float(svh);
+//       out = T(v);
+//   This kernel therefore writes ROW-GRANULAR part[r] (acc = 0 + float(hacc)
+//   per single tile-row, byte-identical to eager's rps=1 split) and reduces it
+//   with the same sequential chain + the same HadOut expression (see
+//   grouped_had_out below), which makes the result independent of this
+//   kernel's own split-K geometry. Bit-exactness is asserted by
+//   tests/test_grouped_gemv.py (fp16 and bf16): 1920/1920 + apply() parity.
+//
+// Result: gate+up = 1 launch, down = 1 launch   (vs 72 eager launches), and
+// the P4-01 routing `.tolist()` syncs disappear (routing stays on device).
+// ============================================================================
+
+#pragma once
+
+namespace exl3 {
+
+// Flat per-call views.  units = NE * nslots.  T = activation dtype (fp16/bf16).
+template <typename T>
+struct MoeGroupedArgs {
+    const T* x;      int x_stride;               // [?, Kdim] row-major
+    int x_unit_stride;  // 0 => all units share x[0] (gate+up); Kdim => x[unit] (down)
+    const uint32_t* tr; int tr_expert_stride;       // uint32 elements per expert (all slots)
+    int tr_slot_stride;                             // uint32 elements per slot inside an expert
+    const fp16* suh;    int suh_expert_stride;      // element strides (weights are fp16)
+    int suh_slot_stride;
+    const fp16* svh;    int svh_expert_stride;
+    int svh_slot_stride;
+    T* out;          int out_unit_stride;        // [units, M, N] -> unit block = M*N elements
+    const int* expert_ids;                          // [units] device array
+    const int* shard;                               // [N/128] suh-group id per output block
+    uint32_t* counters;  int counter_unit_stride;   // [units, N/128], zero on entry
+    float* part;         int part_unit_stride;      // [units, TK, M, N] row-granular
+    int nslots;
+    int M, Kdim, N, tiles_n, rps, n_strips, P, units;
+};
+
+// Input Hadamard — arithmetic identical to exl3_esimd.h fused_had_in (fp16)
+// and HadInKernel<T> (bf16): fp16-round(x*suh) -> fwht128 -> *rsqrt(128),
+// emitted as fp16 (the GEMV always consumes fp16 tiles).
+template <typename T, int MROWS>
+ESIMD_INLINE void grouped_had_in(const T* x, int x_stride, const fp16* suh,
+                                 int M, int Kdim, int shard, int kb,
+                                 simd<fp16, MROWS * 128>& xblk) {
+    simd<float, 128> su = convert<float>(block_load<fp16, 128>(suh + (size_t)shard * Kdim + kb * 128));
+#pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        if (m < M) {
+            simd<float, 128> v =
+                convert<float>(block_load<T, 128>(x + (size_t)m * x_stride + kb * 128)) * su;
+            v = convert<float>(convert<fp16>(v));
+            fwht128(v);
+            v *= kRsqrt128;
+            xblk.template select<128, 1>(m * 128) = convert<fp16>(v);
+        } else {
+            xblk.template select<128, 1>(m * 128) = 0;
+        }
+    }
+}
+
+// Output epilogue that replicates eager HadOutKernel<TOut> ARITHMETIC EXACTLY
+// (Gate 4 parity; see the file header). Split-K arrival protocol = the same
+// counter scheme as fused_had_out (part is written by other work-groups in the
+// SAME launch, so L1-uncached reads are required — eager reads it from a
+// separate kernel, hence its default hints).
+template <typename T>
+ESIMD_INLINE void grouped_had_out(const fp16* svh, T* out, int out_stride,
+                                  uint32_t* counters, const float* part,
+                                  int M, int N, int P, int tk, int col0, int ncols) {
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    int nb = col0 / 128;
+    uint32_t target = (uint32_t)(P * (128 / ncols));
+    simd<uint32_t, 1> off(nb * (uint32_t)sizeof(uint32_t));
+    simd<uint32_t, 1> old = atomic_update<atomic_op::inc, uint32_t, 1>(counters, off);
+    if (old[0] != target - 1) return;
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    atomic_update<atomic_op::store, uint32_t, 1>(counters, off, simd<uint32_t, 1>(0u));
+    for (int m = 0; m < M; ++m) {
+        simd<float, 128> v = 0.0f;
+        constexpr auto props = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>};
+        for (int r = 0; r < tk; ++r) {
+            const float* src = part + ((size_t)r * M + m) * N + nb * 128;
+            v.template select<64, 1>(0) += block_load<float, 64>(src, props);
+            v.template select<64, 1>(64) += block_load<float, 64>(src + 64, props);
+        }
+        fwht128(v);
+        simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
+        v = v * kRsqrt128 * convert<float>(sv);
+        block_store<T, 128>(out + (size_t)m * out_stride + nb * 128, convert<T>(v));
+    }
+}
+
+// One fused unit: input Hadamard -> split-K GEMV -> output Hadamard + SVH.
+template <typename T, int K, int CB, int MR, int NT>
+struct GroupedFusedKernel {
+    using GK = GemvKernel<K, CB, MR, NT, true>;   // reuse its static step<> / Geo
+
+    static constexpr int G0  = Geo<K>::G;
+    static constexpr int V   = Geo<K>::V;
+    static constexpr int W   = Geo<K>::WORDS;
+    static constexpr int D   = Geo<K>::D;
+    static constexpr int TP  = G0 >= 32 ? 1 : 32 / G0;
+    static constexpr int GVV = G0 * TP;
+    static constexpr int NPT = NT / TP;
+    static constexpr int L   = 32 / V;
+#ifdef EXL3_NO_PLANAR
+    static constexpr bool PLANAR = false;
+#else
+    static constexpr bool PLANAR = D > 1;
+#endif
+    static_assert(NT % TP == 0, "NT must be a multiple of the tile pairing");
+    static constexpr int ACC = MR * NPT * 2 * GVV;   // == GK::ACC
+
+    MoeGroupedArgs<T> a;
+    const fp16* lut = nullptr;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        const int id    = (int)it.get_global_id(0);
+        const int per   = a.n_strips * a.P;
+        const int unit  = id / per;
+        if (unit >= a.units) return;
+        const int local = id % per;
+        const int strip = local % a.n_strips;
+        const int p     = local / a.n_strips;
+        if (p * a.rps >= a.Kdim / 16) return;
+
+        const int slot = unit % a.nslots;
+        const int exp  = a.expert_ids[unit];   // caller repeats each expert nslots times
+
+        // Per-unit pointers. x_unit_stride == 0 means every unit consumes the
+        // same token (gate+up at M=1); Kdim means x[unit] (down, per-expert act).
+        const T* xbase = a.x + (size_t)unit * a.x_unit_stride;
+        const fp16* suh = a.suh + (size_t)exp * a.suh_expert_stride
+                                + (size_t)slot * a.suh_slot_stride;
+        const fp16* svh = a.svh + (size_t)exp * a.svh_expert_stride
+                                + (size_t)slot * a.svh_slot_stride;
+        T* out_unit = a.out + (size_t)unit * a.out_unit_stride;
+        uint32_t* counters = a.counters + (size_t)unit * a.counter_unit_stride;
+        const uint32_t* tr = a.tr + (size_t)exp * a.tr_expert_stride
+                                  + (size_t)slot * a.tr_slot_stride;
+        float* part = a.part + (size_t)unit * a.part_unit_stride;
+
+        const int tiles_n = a.tiles_n;
+        const int tile_n0 = strip * NT;
+        const int TK      = a.Kdim / 16;
+        const int r0 = p * a.rps;
+        if (r0 >= TK) return;
+        int r1 = r0 + a.rps;
+        if (r1 > TK) r1 = TK;
+        const int shard_grp = a.shard[(tile_n0 * 16) / 128];
+
+        for (int rb = r0; rb < r1; rb += 8) {
+            simd<fp16, MR * 128> xblk;
+            grouped_had_in<T, MR>(xbase, a.x_stride, suh, a.M, a.Kdim, shard_grp, rb / 8, xblk);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = rb + i;
+                if (r >= TK) break;
+                const size_t t0 = (size_t)r * tiles_n + tile_n0;
+                simd<uint32_t, NT * W> words, prev;
+                load_words<NT, W>(tr + t0 * W, t0 == 0, words, prev);
+                if constexpr (PLANAR) {
+                    planarize<NPT, D, GVV>(words);
+                    planarize<NPT, D, GVV>(prev);
+                }
+                simd<fp16, MR * 16> xr;
+#pragma unroll
+                for (int m = 0; m < MR; ++m)
+                    xr.template select<16, 1>(m * 16) =
+                        xblk.template select<16, 1>(m * 128 + i * 16);
+                simd<fp16, ACC> hacc = 0;
+                GK::template step<0>(words, prev, xr, hacc, lut);
+                // Row-granular fp32 partial: acc = 0 + float(hacc) reduced to
+                // part[r] — byte-for-byte what eager's rps=1 GEMV split writes,
+                // so grouped_had_out's sequential chain over r matches
+                // HadOutKernel bit-for-bit (see file header).
+                simd<float, ACC> acc = 0.0f;
+                acc += convert<float>(hacc);
+#pragma unroll
+                for (int m = 0; m < MR; ++m) {
+                    if (m >= a.M) break;
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        simd<float, 16> o;
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const int base = ((m * NPT + j / TP) * 2 + h) * GVV + (j % TP) * G0;
+                            simd<float, 8> s = acc.template select<8, L>(base);
+#pragma unroll
+                            for (int l = 1; l < L; ++l) s += acc.template select<8, L>(base + l);
+                            o.template select<8, 1>(h * 8) = s;
+                        }
+                        block_store<float, 16>(part + ((size_t)r * a.M + m) * a.N
+                                                            + (tile_n0 + j) * 16, o);
+                    }
+                }
+            }
+        }
+        // last split to finish also does the output Hadamard + SVH
+        grouped_had_out<T>(svh, out_unit, a.N, counters, part,
+                           a.M, a.N, a.P, TK, tile_n0 * 16, NT * 16);
+    }
+};
+
+template <typename T, int K, int CB>
+static void launch_grouped(const MoeGroupedArgs<T>& a, const fp16* lut, sycl::queue& q) {
+    constexpr int MR = 1;                       // P4-02 scope: single-token decode
+    constexpr int NT = nt_of(K, MR);
+    const int n = a.units * a.n_strips * a.P;
+    GroupedFusedKernel<T, K, CB, MR, NT> k{a, lut};
+    const int local = 8;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k);
+    });
+}
+
+}  // namespace exl3
+
+// ---------------------------------------------------------------------------
+// Host op: one grouped fused launch across all (expert, slot) units.
+//   x         : [rows, Kdim] fp16 or bf16  (rows == 1 for shared-x mode)
+//   tr_arena  : [E, nslots, r, tn, 16K] int16
+//   suh       : [E, nslots, Kdim] fp16     svh : [E, nslots, N] fp16
+//   expert_ids: [units] int32 (device; unit -> expert, expert repeated nslots times)
+//   shard     : [N/128] int32
+// Returns out [units, M, N] (M == 1) in x's dtype; part/counters are internal
+// stream-ordered scratch (freed on exit).
+// ---------------------------------------------------------------------------
+at::Tensor exl3_moe_grouped_gemv(at::Tensor x, at::Tensor tr_arena, at::Tensor suh_arena,
+                                 at::Tensor svh_arena, at::Tensor expert_ids, at::Tensor shard,
+                                 int64_t nslots, int64_t N, int64_t K, int64_t cb,
+                                 int64_t x_unit_stride) {
+    TORCH_CHECK(x.dim() == 2,
+                "exl3_moe_grouped_gemv: x must be [rows, Kdim], got ", x.dim(), "D");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
+                "exl3_moe_grouped_gemv: expected fp16/bf16 x, got ", x.scalar_type());
+    TORCH_CHECK(tr_arena.scalar_type() == at::kShort && tr_arena.is_contiguous(),
+                "exl3_moe_grouped_gemv: trellis must be contiguous int16");
+    TORCH_CHECK(tr_arena.dim() == 5 && tr_arena.size(4) == 16 * K,
+                "exl3_moe_grouped_gemv: trellis arena must be [E, nslots, r, tn, 16K]");
+    TORCH_CHECK(tr_arena.size(1) == nslots && suh_arena.size(1) == nslots
+                    && svh_arena.size(1) == nslots,
+                "exl3_moe_grouped_gemv: nslots mismatch");
+    TORCH_CHECK(svh_arena.size(2) == N, "exl3_moe_grouped_gemv: svh N mismatch");
+    TORCH_CHECK(shard.dim() == 1 && shard.size(0) == N / 128,
+                "exl3_moe_grouped_gemv: shard_of_nb must be [N/128]");
+    TORCH_CHECK(suh_arena.scalar_type() == at::kHalf && svh_arena.scalar_type() == at::kHalf,
+                "exl3_moe_grouped_gemv: suh/svh are fp16 weights");
+
+    const int E        = (int)tr_arena.size(0);
+    const int M        = 1;                 // decode scope: one row per unit
+    const int Kdim     = (int)x.size(1);
+    const int tiles_n  = (int)tr_arena.size(3);
+    const int units    = (int)expert_ids.size(0);
+    const int NT       = nt_of(K, 1);
+    if (x_unit_stride == 0) {
+        TORCH_CHECK(x.size(0) == 1,
+                    "exl3_moe_grouped_gemv: shared-x mode needs x rows==1, got ", x.size(0));
+    } else {
+        TORCH_CHECK(x.size(0) >= units,
+                    "exl3_moe_grouped_gemv: per-unit x needs rows>=units (",
+                    x.size(0), " < ", units, ")");
+    }
+
+    // split-K shape (geometry is numerics-neutral: part is row-granular and
+    // grouped_had_out sums rows sequentially, exactly like eager's rps=1
+    // GEMV + HadOutKernel — see the file header comment)
+    const int TK = Kdim / 16;
+    int n_strips = tiles_n / NT;
+    int P = std::max(1, std::min(TK / 8, (g_target_threads + n_strips - 1) / n_strips));
+    int rps = ((TK + P - 1) / P + 7) / 8 * 8;   // multiple of 8 tile-rows
+    P = (TK + rps - 1) / rps;
+
+    auto opts = x.options();
+    auto out      = at::empty({units, M, N}, opts);
+    auto part     = at::empty({units, TK, M, N}, opts.dtype(at::kFloat));
+    auto counters = at::zeros({units, N / 128}, opts.dtype(at::kInt));
+
+    // strides in element units
+    const int tr_total      = (int)(tr_arena.numel() / 2);        // int16 -> uint32 words
+    const int tr_expert_st  = tr_total / E;
+    const int tr_slot_st    = tr_total / (E * (int)nslots);
+    const int suh_expert_st = (int)(suh_arena.numel() / E);
+    const int suh_slot_st   = (int)(suh_arena.numel() / (E * (int)nslots));
+    const int svh_expert_st = (int)(svh_arena.numel() / E);
+    const int svh_slot_st   = (int)(svh_arena.numel() / (E * (int)nslots));
+    const int out_unit_st   = M * (int)N;
+    const int cnt_unit_st   = (int)(N / 128);
+    const int part_unit_st  = TK * M * (int)N;   // row-granular: [TK, M, N]
+
+    auto& q = queue_of(x);
+    const fp16* lut = nullptr;
+#ifdef EXL3_LUT
+    lut = lut_for((int)cb, x, q);
+#endif
+
+    auto run = [&](auto tag) {
+        using T = decltype(tag);
+        MoeGroupedArgs<T> a{
+            reinterpret_cast<const T*>(x.data_ptr()), (int)x.stride(0),
+            (int)x_unit_stride,
+            reinterpret_cast<const uint32_t*>(tr_arena.data_ptr()), tr_expert_st, tr_slot_st,
+            reinterpret_cast<const fp16*>(suh_arena.data_ptr()), suh_expert_st, suh_slot_st,
+            reinterpret_cast<const fp16*>(svh_arena.data_ptr()), svh_expert_st, svh_slot_st,
+            reinterpret_cast<T*>(out.data_ptr()), out_unit_st,
+            reinterpret_cast<const int*>(expert_ids.data_ptr()),
+            reinterpret_cast<const int*>(shard.data_ptr()),
+            reinterpret_cast<uint32_t*>(counters.data_ptr()), cnt_unit_st,
+            reinterpret_cast<float*>(part.data_ptr()), part_unit_st,
+            (int)nslots, M, Kdim, (int)N, tiles_n, rps, n_strips, P, units};
+        if (K == 3 && cb == 1)      launch_grouped<T, 3, 1>(a, lut, q);
+        else if (K == 4 && cb == 1) launch_grouped<T, 4, 1>(a, lut, q);
+        else if (K == 6 && cb == 1) launch_grouped<T, 6, 1>(a, lut, q);
+        else if (K == 4 && cb == 2) launch_grouped<T, 4, 2>(a, lut, q);
+        else if (K == 6 && cb == 2) launch_grouped<T, 6, 2>(a, lut, q);
+        else TORCH_CHECK(false, "exl3_moe_grouped_gemv: unsupported K/codebook ", K, "/", cb);
+    };
+    if (x.scalar_type() == at::kHalf) run(fp16{});
+    else run(sycl::ext::oneapi::bfloat16{});
+    return out;
+}
