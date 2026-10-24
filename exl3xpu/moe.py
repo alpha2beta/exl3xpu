@@ -287,6 +287,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         # Reused read-only ``shard_of_nb`` buffers (one per (device, n)).
         self._nb_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
+        # P4-01 zero-copy execution cache (built lazily from the arenas).
+        self._exec_cache: dict[str, Any] | None = None
         # Optional P2-08 diagnostic capture (None = disabled, zero overhead).
         self._debug_capture: dict[str, Any] | None = None
 
@@ -1020,6 +1022,58 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             m["cb"],
         )
 
+    # -- P4-01: zero-copy execution cache ------------------------------------
+    def _build_exec_cache(self, layer: "RoutedExperts") -> None:
+        """Per-projection arena handles, sliced once (no per-call sync).
+
+        P4-01. The P2-01 ``apply`` built handles per call through
+        ``expert_views`` → ``descriptor`` → ``.tolist()``, which forces a
+        device→host sync per expert per projection (~24 syncs/token at decode).
+        These handles are *views* into the stacked arenas, so indexing them
+        with a Python expert id costs no copy and no sync. ``K``/``cb`` are
+        layer-constant (validated in the constructor), so they are read from
+        ``self`` rather than from the descriptor buffer.
+        """
+        self._exec_cache = {
+            # projection: (trellis[E,...], suh[E,k], svh[E,n], n)
+            "gate": (getattr(layer, "w13_trellis")[:, 0],
+                     getattr(layer, "w13_suh")[:, 0],
+                     getattr(layer, "w13_svh")[:, 0],
+                     self.intermediate_size_per_partition),
+            "up": (getattr(layer, "w13_trellis")[:, 1],
+                   getattr(layer, "w13_suh")[:, 1],
+                   getattr(layer, "w13_svh")[:, 1],
+                   self.intermediate_size_per_partition),
+            "down": (getattr(layer, "w2_trellis")[:, 0],
+                     getattr(layer, "w2_suh")[:, 0],
+                     getattr(layer, "w2_svh")[:, 0],
+                     self.hidden_size),
+        }
+
+    def _cached_linear(self, projection: str, expert_id: int, x: torch.Tensor) -> torch.Tensor:
+        from . import ops
+
+        tr, suh, svh, n = self._exec_cache[projection]
+        return ops.exl3_linear(
+            x,
+            tr[expert_id],
+            suh[expert_id].unsqueeze(0),
+            svh[expert_id],
+            self._shard_of_nb(x.device, n),
+            [0, n],
+            self.K,
+            self.cb,
+        )
+
+    def _expert_mlp_cached(self, expert_id: int, x: torch.Tensor) -> torch.Tensor:
+        """Routed-expert MLP via the zero-copy cache (no per-call sync)."""
+        import torch.nn.functional as F
+
+        gate = self._cached_linear("gate", expert_id, x)
+        up = self._cached_linear("up", expert_id, x)
+        act = F.silu(gate) * up
+        return self._cached_linear("down", expert_id, act)
+
     def _expert_mlp(
         self, layer: "RoutedExperts", expert_id: int, x: torch.Tensor
     ) -> torch.Tensor:
@@ -1071,6 +1125,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         SiLU/up and the output Hadamard), never to the input activations
         (P2-03). Experts receiving no tokens are skipped. A Python loop over
         active experts is the Gate 2 baseline; grouped kernels come in Phase 4.
+
+        P4-01: the per-expert handles are sliced once into a zero-copy cache
+        and the single-token decode path reads the routing decision with one
+        host sync (instead of ~27 per-expert descriptor/validation syncs).
         """
         hidden = x.shape[-1]
         x2 = x.reshape(-1, hidden)
@@ -1091,24 +1149,45 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 f"exl3: MoE {self.prefix}: {topk_ids.shape[0]} routing rows for "
                 f"{x2.shape[0]} tokens"
             )
-        if topk_ids.numel() and (
-            int(topk_ids.min()) < 0 or int(topk_ids.max()) >= self.num_local_experts
-        ):
-            raise Exl3MoEUnsupported(
-                f"exl3: MoE {self.prefix}: routing index outside "
-                f"[0, {self.num_local_experts})"
-            )
+
+        if getattr(self, "_exec_cache", None) is None:
+            self._build_exec_cache(layer)
 
         # Routed output accumulated in fp32, cast back at the end.
         out = torch.zeros(x2.shape, dtype=torch.float32, device=x2.device)
         weights = topk_weights.to(torch.float32)
+        tokens = x2.shape[0]
+
+        if self._debug_capture is None and tokens == 1:
+            # --- P4-01 single-token (decode) fast path ----------------------
+            # One host sync for the routing decision; every expert handle is a
+            # zero-copy cache view, so there are no further syncs.
+            ids = topk_ids.view(-1).tolist()
+            wts = weights.view(-1).tolist()
+            for expert_id, wt in zip(ids, wts):
+                y = self._expert_mlp_cached(int(expert_id), x2)
+                out += y.to(torch.float32) * wt
+            return out.to(x2.dtype).reshape(x.shape)
+
+        # --- general (prefill / multi-token) path ---------------------------
+        if self._debug_capture is not None and topk_ids.numel():
+            # Range validation is a device->host sync; keep it on the debug
+            # path only (the arena shape is asserted once at load time).
+            if int(topk_ids.min()) < 0 or int(topk_ids.max()) >= self.num_local_experts:
+                raise Exl3MoEUnsupported(
+                    f"exl3: MoE {self.prefix}: routing index outside "
+                    f"[0, {self.num_local_experts})"
+                )
 
         for expert_id in torch.unique(topk_ids).tolist():
             token_idx, slot_idx = (topk_ids == expert_id).nonzero(as_tuple=True)
             if token_idx.numel() == 0:
                 continue
             rows = x2.index_select(0, token_idx)
-            y = self._expert_mlp(layer, int(expert_id), rows)
+            if self._debug_capture is not None:
+                y = self._expert_mlp(layer, int(expert_id), rows)
+            else:
+                y = self._expert_mlp_cached(int(expert_id), rows)
             w = weights[token_idx, slot_idx].unsqueeze(-1)
             out.index_add_(0, token_idx, y.to(torch.float32) * w)
 
