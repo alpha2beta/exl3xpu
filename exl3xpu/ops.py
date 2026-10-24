@@ -52,6 +52,21 @@ def _get_esimd():
 _wbuf: dict = {}
 
 
+def small_m_max(K: int, cb: int) -> int:
+    """Largest M the fused small-M path can serve for this (K, cb).
+
+    `SMALL_M_MAX` is the compiled default and only applies to formats with a
+    DPAS instantiation. On a no-XMX part (Arc 140V) the vector-only routed
+    format K=3/mcg tops out at the kernel's 8-row limit, so M > 8 must take
+    reconstruct+GEMM; asking `exl3_gemm_small` for more rows trips a hard
+    TORCH_CHECK rather than falling back.
+    """
+    esimd = _get_esimd() if _backend != "triton" else False
+    if esimd and hasattr(esimd, "exl3_small_m_max"):
+        return min(SMALL_M_MAX, int(esimd.exl3_small_m_max(K, cb)))
+    return SMALL_M_MAX
+
+
 def _weight_buffer(device, numel):
     buf = _wbuf.get(device)
     if buf is None or buf.numel() < numel:
@@ -75,7 +90,7 @@ def exl3_linear_impl(x: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, 
 
     esimd = _get_esimd() if _backend != "triton" else False
 
-    if M <= SMALL_M_MAX:
+    if M <= small_m_max(K, cb):
         if esimd and esimd.exl3_supported(K, cb):
             esimd.exl3_gemm_small(x2, trellis, suh, svh, shard_of_nb, out, K, cb)
         else:
@@ -97,7 +112,9 @@ def exl3_linear_impl(x: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, 
         for n0 in range(g0, g1, RECON_SLICE_N):
             n1 = min(n0 + RECON_SLICE_N, g1)
             w = _weight_buffer(x.device, k * (n1 - n0)).view(k, n1 - n0)
-            if esimd and hasattr(esimd, "exl3_reconstruct"):
+            # 140V: C++ reconstruct only instantiates supported K/cb (no K=1
+            # even under EXL3_ALL_CODEBOOKS); fall back to K-generic Triton.
+            if esimd and hasattr(esimd, "exl3_reconstruct") and esimd.exl3_supported(K, cb):
                 esimd.exl3_reconstruct(trellis, w, n0, K, cb)
             else:
                 tk.reconstruct(trellis, K, cb, n0, n1 - n0, out=w)
@@ -133,5 +150,6 @@ def exl3_linear(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb):
     if INT8_PREFILL and x.numel() // x.shape[-1] > SMALL_M_MAX and not (esimd and hasattr(esimd, "exl3_set_int8")):
         return _exl3_linear_py(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb)
     if esimd and hasattr(esimd, "linear") and esimd.exl3_supported(K, cb):
-        return esimd.linear(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb, SMALL_M_MAX, RECON_SLICE_N)
+        return esimd.linear(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb,
+                            small_m_max(K, cb), RECON_SLICE_N)
     return _exl3_linear_py(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb)

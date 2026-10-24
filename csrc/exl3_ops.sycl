@@ -169,7 +169,9 @@ static bool dispatch_dpas(int MB, const at::Tensor& xh, const at::Tensor& tr, co
 #define EXL3_DPAS24_NT 2
 #endif
 static int dpas_nt(int MB) { return MB == 4 ? EXL3_DPAS4_NT : MB == 8 ? EXL3_DPAS8_NT : MB == 24 ? EXL3_DPAS24_NT : (MB == 40 || MB == 48) ? 2 : (MB <= 16 ? 4 : (MB == 32 ? EXL3_DPAS32_NT : EXL3_DPAS64_NT)); }
-static int g_vec_max_m = 2;   // vector kernel for M<=2, DPAS (flat cost up to M=8) above
+// Arc 140V baseline (no XMX/DPAS): vector kernel for M<=8 (dispatch_mr covers
+// MR=1/2/4/8 with tail guards). M above this must use reconstruct+GEMM.
+static int g_vec_max_m = 8;
 
 // Split-K sizing: threads to aim for when choosing the number of K splits. Measured on B70 (all linears,
 // graph-captured): 1024 beats 4096 by 10-20% for M=1..32 (fewer fp32 partials for had_out to reduce, and the
@@ -180,7 +182,14 @@ static int g_target_threads_mb64 = 2048;
 
 // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
 // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
-constexpr int nt_of(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+// Arc 140V / EXL3_ALL_CODEBOOKS: K=3,5 decode G=8 lanes per vector op (TP=4),
+// so an MR=8 thread needs NT>=4 to satisfy GemvKernel's NT%TP==0 (NT=2 fails
+// the static_assert). ACC stays smaller than the tuned K=4/MR=8 case, and no
+// previously-compiling case changes value.
+constexpr int nt_of(int K, int MR) {
+    if (MR == 8 && (K == 3 || K == 5)) return 4;
+    return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4);
+}
 static int nt_for(int K, int MR) { return nt_of(K, MR); }
 
 template <int K, int CB>
@@ -212,6 +221,10 @@ static void launch_fused(KernelT k, int n, sycl::queue& q) {
 template <int K, int CB>
 static bool fused_small(const at::Tensor& x, const at::Tensor& tr, const at::Tensor& suh, const at::Tensor& svh,
                         const at::Tensor& shard, at::Tensor& out, int M, int Kdim, int N, sycl::queue& q) {
+    // Arc 140V baseline: the fused kernel only instantiates MR=1/2 (rows beyond
+    // m=1 are never computed). Decline larger M so the caller falls through to
+    // the unfused vector path, which covers MR up to 8.
+    if (M > 2) return false;
     int tk = Kdim / 16, tiles_n = N / 16;
     bool vec = M <= g_vec_max_m;
     int NT = vec ? (M <= 1 ? nt_of(K, 1) : nt_of(K, 2)) : dpas_nt(8);
@@ -258,6 +271,11 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     TORCH_CHECK(trellis.scalar_type() == at::kShort && trellis.is_contiguous());
     auto& q = queue_of(x);
     int M = x.size(0), Kdim = x.size(1), N = svh.size(0), S = suh.size(0);
+    // Arc 140V baseline (no XMX/DPAS): fail loudly instead of dispatching DPAS.
+    // Production callers route M > g_vec_max_m via reconstruct+GEMM
+    // (EXL3_SMALL_M_MAX); direct op calls with M > 8 are a caller bug.
+    TORCH_CHECK(M <= g_vec_max_m, "exl3_gemm_small: M=", M,
+                " exceeds no-DPAS vector limit ", g_vec_max_m);
     if (g_fused && M <= 8 && x.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf && out.stride(1) == 1 &&
         N / 128 <= (1 << 16)) {
         bool done = false;
@@ -309,6 +327,12 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     EXL3_CASE(4, 0) EXL3_CASE(4, 1) EXL3_CASE(6, 0) EXL3_CASE(6, 1)
 #endif
 #undef EXL3_CASE
+    // K=3 / MCG vector GEMV: the routed-expert format of Qwen3.5-35B-A3B
+    // (30 720 modules). Only the vector kernel is instantiated here; the DPAS
+    // table stays untouched because K=3 decode is not wired into it and the
+    // Arc 140V has no XMX units, so this path is unreachable there.
+    if (K == 3 && cb == 1 && use_vec)
+        ok = dispatch_mr<3, 1>(MR, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
     TORCH_CHECK(ok, "exl3_gemm_small: unsupported K/codebook ", K, "/", cb);
 
     if (out.scalar_type() == at::kHalf) launch_had_out<fp16>(part, P, svh, out, q);
@@ -540,6 +564,11 @@ void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, i
     bool ok = true;
     if (K == 4 && cb == 2) launch_reconstruct<4, 2>(trellis, w, n0, q);
     else if (K == 6 && cb == 2) launch_reconstruct<6, 2>(trellis, w, n0, q);
+    // K=3 / MCG: the routed-expert format of Qwen3.5-35B-A3B (and a CUDA
+    // instantiation exllamav3 already ships as exl3_moe_inst_k3_cb1). Kept out
+    // of the ALL_CODEBOOKS block so the default build can always dequantize
+    // this checkpoint on the prefill (reconstruct + GEMM) path.
+    else if (K == 3 && cb == 1) launch_reconstruct<3, 1>(trellis, w, n0, q);
 #ifdef EXL3_ALL_CODEBOOKS
     else if (K == 2 && cb == 2) launch_reconstruct<2, 2>(trellis, w, n0, q);
     else if (K == 3 && cb == 2) launch_reconstruct<3, 2>(trellis, w, n0, q);
@@ -586,6 +615,7 @@ at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor s
                                         : dispatch_dpas<4, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
     if (K == 6 && cb == 2) ok = use_vec ? dispatch_mr<6, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
                                         : dispatch_dpas<6, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+    if (K == 3 && cb == 1) ok = use_vec && dispatch_mr<3, 1>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
     TORCH_CHECK(ok);
     (void)S;
     return part.sum(0);
@@ -633,13 +663,13 @@ bool exl3_supported(int64_t K, int64_t cb);
 //   M <= small_m_max : fused decode-in-GEMM (vector / DPAS)
 //   otherwise        : row-major input Hadamard -> reconstruct W_inner slices -> oneDNN GEMM -> output Hadamard
 
-static at::Tensor& weight_scratch(const at::Device& dev, int64_t numel) {
-    static std::vector<at::Tensor> bufs(16);
-    auto& b = bufs.at(dev.index());
-    if (!b.defined() || b.numel() < numel)
-        b = at::empty({numel}, at::TensorOptions().dtype(at::kHalf).device(dev));
-    return b;
-}
+// NOTE: the large-M path used to reconstruct into a per-device static scratch
+// buffer. That buffer was not keyed by stream, so two in-flight calls on
+// different XPU streams would race on the same weight slice. Allocate the
+// slice per call instead: the caching allocator is stream-ordered, so
+// concurrent calls get distinct, safe buffers and the block is reused on the
+// same stream once the call returns. At RECON_SLICE_N=1024 this is a bounded
+// k*1024 fp16 slice (4 MiB at k=2048), never a persistent per-layer copy.
 
 at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tensor svh, at::Tensor shard_of_nb,
                        std::vector<int64_t> group_bounds, int64_t K, int64_t cb, int64_t small_m_max,
@@ -739,7 +769,7 @@ at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Ten
         int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1];
         for (int64_t n0 = g0; n0 < g1; n0 += slice_n) {
             int64_t n1 = std::min(n0 + slice_n, g1);
-            auto w = weight_scratch(x.device(), k * (n1 - n0)).narrow(0, 0, k * (n1 - n0)).view({k, n1 - n0});
+            auto w = at::empty({k, n1 - n0}, x.options().dtype(at::kHalf));
             exl3_reconstruct(trellis, w, n0, K, cb);
             auto yslice = y.narrow(1, n0, n1 - n0);
             at::matmul_out(yslice, xh[g], w);
@@ -759,11 +789,23 @@ at::Tensor exl3_linear_meta(at::Tensor x, at::Tensor trellis, at::Tensor suh, at
 
 bool exl3_supported(int64_t K, int64_t cb) {
     if (cb == 2 && (K == 4 || K == 6)) return true;
+    if (cb == 1 && K == 3) return true;   // Qwen3.5-35B-A3B routed experts
 #ifdef EXL3_ALL_CODEBOOKS
     if (cb == 2 && (K == 2 || K == 3 || K == 5)) return true;
     if ((cb == 0 || cb == 1) && (K == 4 || K == 6)) return true;
 #endif
     return false;
+}
+
+// Largest M the fused small-M path can serve for a given (K, cb).
+// Formats with a DPAS instantiation are bounded only by the caller's
+// SMALL_M_MAX (Python caps at 128); the vector-only K=3/mcg routed-expert
+// path is bounded by the vector kernel's row limit (g_vec_max_m == 8 on this
+// no-XMX part, where dispatch_dpas<K,1> is deliberately not instantiated).
+int64_t exl3_small_m_max(int64_t K, int64_t cb) {
+    if (!exl3_supported(K, cb)) return 0;
+    if (K == 3 && cb == 1) return g_vec_max_m;
+    return 1 << 20;
 }
 
 void exl3_set_target_threads(int64_t n) { g_target_threads = (int)n; }
@@ -784,6 +826,7 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_gemm_small(Tensor x, Tensor trellis, Tensor suh, Tensor svh, Tensor shard_of_nb, Tensor(a!) out, int K, int cb) -> ()");
     m.impl("exl3_gemm_small", torch::kXPU, &exl3_gemm_small);
     m.def("exl3_supported(int K, int cb) -> bool", &exl3_supported);
+    m.def("exl3_small_m_max(int K, int cb) -> int", &exl3_small_m_max);
     m.def("exl3_had_in_rm(Tensor x, Tensor suh, Tensor(a!) xh) -> ()");
     m.impl("exl3_had_in_rm", torch::kXPU, &exl3_had_in_rm);
     m.def("exl3_had_out_h(Tensor y, Tensor svh, Tensor(a!) out) -> ()");
