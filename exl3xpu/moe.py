@@ -1165,6 +1165,144 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         w = weights.view(-1).to(torch.float32).unsqueeze(1)
         return (dn.squeeze(1).to(torch.float32) * w).sum(dim=0).to(x1.dtype)
 
+    # -- P4-03: grouped small-M prefill path ----------------------------------
+    def _grouped_mlp_prefill(
+        self,
+        layer: "RoutedExperts",
+        x2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """P4-03: Multi-token grouped prefill GEMM for small-M experts.
+
+        Sorts token assignments into expert bins on the device, launches
+        exl3_moe_grouped_gemm for all active experts with M_u <= 8 in ONE launch
+        for gate+up and ONE launch for down, and falls back to cached linear
+        only for hot experts with M_u > 8.
+        """
+        import torch.nn.functional as F
+
+        if getattr(self, "_grouped_gemm_supported", None) is False:
+            return None
+        if not hasattr(torch.ops.exl3xpu_C, "exl3_moe_grouped_gemm"):
+            self._grouped_gemm_supported = False
+            return None
+
+        try:
+            T, k = topk_ids.shape
+            dev = x2.device
+            flat_ids = topk_ids.reshape(-1)
+            if flat_ids.dtype != torch.int32:
+                flat_ids = flat_ids.to(torch.int32)
+            flat_weights = weights.reshape(-1)
+            flat_token_ids = (
+                torch.arange(T, device=dev, dtype=torch.int32)
+                .unsqueeze(1)
+                .expand(T, k)
+                .reshape(-1)
+            )
+
+            # Sort assignments on device
+            sort_order = torch.argsort(flat_ids)
+            sorted_expert_ids = flat_ids[sort_order]
+            sorted_token_ids = flat_token_ids[sort_order]
+            sorted_weights = flat_weights[sort_order]
+
+            # Gather x according to sorted token assignments
+            x_sorted = x2.index_select(0, sorted_token_ids)
+
+            # Identify contiguous expert slices
+            unique_experts, counts = torch.unique_consecutive(
+                sorted_expert_ids, return_counts=True
+            )
+            unique_experts = unique_experts.to(torch.int32)
+            counts = counts.to(torch.int32)
+            U = unique_experts.shape[0]
+            if U == 0:
+                return torch.zeros_like(x2)
+
+            offsets = torch.zeros(U, dtype=torch.int32, device=dev)
+            offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+
+            inter = self.intermediate_size_per_partition
+            shard13 = self._shard_of_nb(dev, inter)
+            shard2 = self._shard_of_nb(dev, self.hidden_size)
+            total_tokens = x_sorted.shape[0]
+
+            # If any expert has M > 8, chunk them into units with M <= 8
+            # so the grouped kernel handles 100% of tokens in a unified launch
+            # without requiring slow eager linear fallbacks.
+            if (counts > 8).any():
+                chunk_exp = []
+                chunk_cnt = []
+                chunk_off = []
+                for exp, cnt, off in zip(
+                    unique_experts.tolist(), counts.tolist(), offsets.tolist()
+                ):
+                    while cnt > 8:
+                        chunk_exp.append(exp)
+                        chunk_cnt.append(8)
+                        chunk_off.append(off)
+                        off += 8
+                        cnt -= 8
+                    chunk_exp.append(exp)
+                    chunk_cnt.append(cnt)
+                    chunk_off.append(off)
+                unique_experts = torch.tensor(
+                    chunk_exp, dtype=torch.int32, device=dev
+                )
+                counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
+                offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
+                U = unique_experts.shape[0]
+
+            ids13 = unique_experts.repeat_interleave(2)
+            m13 = counts.repeat_interleave(2)
+            off13 = offsets.repeat_interleave(2)
+
+            gu = torch.ops.exl3xpu_C.exl3_moe_grouped_gemm(
+                x_sorted,
+                layer.w13_trellis,
+                layer.w13_suh,
+                layer.w13_svh,
+                ids13,
+                shard13,
+                m13,
+                off13,
+                off13,
+                total_tokens,
+                2,
+                inter,
+                self.K,
+                self.cb,
+            )
+            act = (F.silu(gu[0]) * gu[1]).contiguous()
+            dn = torch.ops.exl3xpu_C.exl3_moe_grouped_gemm(
+                act,
+                layer.w2_trellis,
+                layer.w2_suh,
+                layer.w2_svh,
+                unique_experts,
+                shard2,
+                counts,
+                offsets,
+                offsets,
+                total_tokens,
+                1,
+                self.hidden_size,
+                self.K,
+                self.cb,
+            )
+
+            # Scatter-add weighted outputs back to original token positions
+            out = torch.zeros((T, self.hidden_size), dtype=torch.float32, device=dev)
+            out.index_add_(
+                0, sorted_token_ids, dn.to(torch.float32) * sorted_weights.unsqueeze(-1)
+            )
+            return out.to(x2.dtype)
+        except Exception:
+            self._grouped_gemm_supported = False
+            return None
+
     def _expert_mlp(
         self, layer: "RoutedExperts", expert_id: int, x: torch.Tensor
     ) -> torch.Tensor:
@@ -1266,7 +1404,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 out += y.to(torch.float32) * wt
             return out.to(x2.dtype).reshape(x.shape)
 
-        # --- general (prefill / multi-token) path ---------------------------
+        if self._debug_capture is None and tokens > 1:
+            # --- P4-03 grouped prefill fast path ------------------------------
+            y = self._grouped_mlp_prefill(layer, x2, topk_ids, weights)
+            if y is not None:
+                return y.reshape(x.shape)
+
+        # --- general (prefill / multi-token) fallback path ------------------
         if self._debug_capture is not None and topk_ids.numel():
             # Range validation is a device->host sync; keep it on the debug
             # path only (the arena shape is asserted once at load time).

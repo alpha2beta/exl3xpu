@@ -1,0 +1,346 @@
+// ============================================================================
+// exl3_moe_grouped_gemm.sycl — P4-03: grouped small-M prefill GEMM for EXL3
+// ----------------------------------------------------------------------------
+// Attribution
+//   Phase/Task : Phase 4 / P4-03
+//   Author     : EXL3 vLLM-MoE bring-up agent
+//   Date       : 2026-10-25
+//   Scope      : NEW FILE. Adds ONE grouped launch per projection across all
+//                active small-M (M <= 8) prefill experts.
+//
+// Why (P4-03 motivation)
+//   Under top-8 routing over 256 experts, a 128-token prefill chunk averages
+//   only M=4 tokens per active expert (and 256 tokens averages M=8).
+//   97-100% of active experts receive M <= 8 tokens.
+//   Eager prefill executes a Python loop over ~100-250 active experts, issuing
+//   ~1000-2500 kernel launches per layer (40,000-100,000 per prompt), bottlenecked
+//   by driver launch submission latency.
+//   This kernel executes ALL small-M active experts in ONE grouped launch for
+//   gate+up and ONE grouped launch for down, eliminating host loops.
+//
+// Design
+//   * units = active_experts * nslots.
+//   * Each unit u processes M_u <= 8 tokens (m_per_unit[u]).
+//   * x_offsets[u]: token start index in x for unit u.
+//   * out_offsets[u]: token start index in out for unit u.
+//   * For gate+up (nslots=2): out is [2, total_out_tokens, N].
+//     Unit 2*i (gate) writes to out[0, out_offsets[2*i]:...].
+//     Unit 2*i+1 (up) writes to out[1, out_offsets[2*i+1]:...].
+//   * For down (nslots=1): out is [total_out_tokens, N].
+//   * Templated on T = sycl::half | sycl::ext::oneapi::bfloat16.
+// ============================================================================
+
+#pragma once
+
+namespace exl3 {
+
+template <typename T>
+struct MoeGroupedGemmArgs {
+    const T* x;
+    int x_stride;
+    const uint32_t* tr;
+    int tr_expert_stride;
+    int tr_slot_stride;
+    const fp16* suh;
+    int suh_expert_stride;
+    int suh_slot_stride;
+    const fp16* svh;
+    int svh_expert_stride;
+    int svh_slot_stride;
+    T* out;
+    int out_slot_stride;
+    const int* expert_ids;
+    const int* shard;
+    const int* m_per_unit;
+    const int* x_offsets;
+    const int* out_offsets;
+    uint32_t* counters;
+    int counter_unit_stride;
+    float* part;
+    int part_unit_stride;
+    int nslots;
+    int Kdim, N, tiles_n, rps, n_strips, P, units;
+};
+
+template <typename T, int MROWS>
+ESIMD_INLINE void grouped_gemm_had_in(const T* xbase, int x_stride, const fp16* suh,
+                                      int M, int Kdim, int shard, int kb,
+                                      simd<fp16, MROWS * 128>& xblk) {
+    simd<float, 128> su = convert<float>(block_load<fp16, 128>(suh + (size_t)shard * Kdim + kb * 128));
+#pragma unroll
+    for (int m = 0; m < MROWS; ++m) {
+        if (m < M) {
+            simd<float, 128> v =
+                convert<float>(block_load<T, 128>(xbase + (size_t)m * x_stride + kb * 128)) * su;
+            v = convert<float>(convert<fp16>(v));
+            fwht128(v);
+            v *= kRsqrt128;
+            xblk.template select<128, 1>(m * 128) = convert<fp16>(v);
+        } else {
+            xblk.template select<128, 1>(m * 128) = 0;
+        }
+    }
+}
+
+template <typename T>
+ESIMD_INLINE void grouped_gemm_had_out(const fp16* svh, T* out, int out_stride,
+                                       uint32_t* counters, const float* part,
+                                       int M, int part_m_stride, int N, int P, int col0, int ncols) {
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    int nb = col0 / 128;
+    uint32_t target = (uint32_t)(P * (128 / ncols));
+    simd<uint32_t, 1> off(nb * (uint32_t)sizeof(uint32_t));
+    simd<uint32_t, 1> old = atomic_update<atomic_op::inc, uint32_t, 1>(counters, off);
+    if (old[0] != target - 1) return;
+    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    atomic_update<atomic_op::store, uint32_t, 1>(counters, off, simd<uint32_t, 1>(0u));
+    for (int m = 0; m < M; ++m) {
+        simd<float, 128> v = 0.0f;
+        constexpr auto props = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::cached>};
+        for (int p = 0; p < P; ++p) {
+            const float* src = part + ((size_t)p * part_m_stride + m) * N + nb * 128;
+            v.template select<64, 1>(0) += block_load<float, 64>(src, props);
+            v.template select<64, 1>(64) += block_load<float, 64>(src + 64, props);
+        }
+        fwht128(v);
+        simd<fp16, 128> sv = block_load<fp16, 128>(svh + nb * 128);
+        v = v * kRsqrt128 * convert<float>(sv);
+        block_store<T, 128>(out + (size_t)m * out_stride + nb * 128, convert<T>(v));
+    }
+}
+
+template <typename T, int K, int CB, int MR, int NT>
+struct GroupedGemmFusedKernel {
+    using GK = GemvKernel<K, CB, MR, NT, true>;
+
+    static constexpr int G0  = Geo<K>::G;
+    static constexpr int V   = Geo<K>::V;
+    static constexpr int W   = Geo<K>::WORDS;
+    static constexpr int D   = Geo<K>::D;
+    static constexpr int TP  = G0 >= 32 ? 1 : 32 / G0;
+    static constexpr int GVV = G0 * TP;
+    static constexpr int NPT = NT / TP;
+    static constexpr int L   = 32 / V;
+#ifdef EXL3_NO_PLANAR
+    static constexpr bool PLANAR = false;
+#else
+    static constexpr bool PLANAR = D > 1;
+#endif
+    static_assert(NT % TP == 0, "NT must be a multiple of the tile pairing");
+    static constexpr int ACC = MR * NPT * 2 * GVV;
+
+    MoeGroupedGemmArgs<T> a;
+    const fp16* lut = nullptr;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        const int id    = (int)it.get_global_id(0);
+        const int per   = a.n_strips * a.P;
+        const int unit  = id / per;
+        if (unit >= a.units) return;
+
+        const int M_u = a.m_per_unit[unit];
+        if (M_u <= 0) return;
+
+        const int local = id % per;
+        const int strip = local % a.n_strips;
+        const int p     = local / a.n_strips;
+        if (p * a.rps >= a.Kdim / 16) return;
+
+        const int slot = unit % a.nslots;
+        const int exp  = a.expert_ids[unit];
+
+        const size_t in_off = (size_t)a.x_offsets[unit];
+        const T* xbase = a.x + in_off * (size_t)a.x_stride;
+
+        const fp16* suh = a.suh + (size_t)exp * a.suh_expert_stride
+                                + (size_t)slot * a.suh_slot_stride;
+        const fp16* svh = a.svh + (size_t)exp * a.svh_expert_stride
+                                + (size_t)slot * a.svh_slot_stride;
+
+        const size_t out_off = (size_t)a.out_offsets[unit];
+        T* out_unit = a.out + (size_t)slot * a.out_slot_stride + out_off * (size_t)a.N;
+
+        uint32_t* counters = a.counters + (size_t)unit * a.counter_unit_stride;
+        const uint32_t* tr = a.tr + (size_t)exp * a.tr_expert_stride
+                                  + (size_t)slot * a.tr_slot_stride;
+        float* part = a.part + (size_t)unit * a.part_unit_stride;
+
+        const int tiles_n = a.tiles_n;
+        const int tile_n0 = strip * NT;
+        const int TK      = a.Kdim / 16;
+        const int r0 = p * a.rps;
+        if (r0 >= TK) return;
+        int r1 = r0 + a.rps;
+        if (r1 > TK) r1 = TK;
+        const int shard_grp = a.shard[(tile_n0 * 16) / 128];
+
+        simd<float, ACC> acc = 0.0f;
+        for (int rb = r0; rb < r1; rb += 8) {
+            simd<fp16, MR * 128> xblk;
+            grouped_gemm_had_in<T, MR>(xbase, a.x_stride, suh, M_u, a.Kdim, shard_grp, rb / 8, xblk);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = rb + i;
+                if (r >= TK) break;
+                const size_t t0 = (size_t)r * tiles_n + tile_n0;
+                simd<uint32_t, NT * W> words, prev;
+                load_words<NT, W>(tr + t0 * W, t0 == 0, words, prev);
+                if constexpr (PLANAR) {
+                    planarize<NPT, D, GVV>(words);
+                    planarize<NPT, D, GVV>(prev);
+                }
+                simd<fp16, MR * 16> xr;
+#pragma unroll
+                for (int m = 0; m < MR; ++m)
+                    xr.template select<16, 1>(m * 16) =
+                        xblk.template select<16, 1>(m * 128 + i * 16);
+                simd<fp16, ACC> hacc = 0;
+                GK::template step<0>(words, prev, xr, hacc, lut);
+                acc += convert<float>(hacc);
+            }
+        }
+
+#pragma unroll
+        for (int m = 0; m < MR; ++m) {
+            if (m >= M_u) break;
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                simd<float, 16> o;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int base = ((m * NPT + j / TP) * 2 + h) * GVV + (j % TP) * G0;
+                    simd<float, 8> s = acc.template select<8, L>(base);
+#pragma unroll
+                    for (int l = 1; l < L; ++l) s += acc.template select<8, L>(base + l);
+                    o.template select<8, 1>(h * 8) = s;
+                }
+                block_store<float, 16>(part + ((size_t)p * MR + m) * a.N
+                                                    + (tile_n0 + j) * 16, o);
+            }
+        }
+
+        // Epilogue: split-K arrival protocol
+        grouped_gemm_had_out<T>(svh, out_unit, a.N, counters, part,
+                                M_u, MR, a.N, a.P, tile_n0 * 16, NT * 16);
+    }
+};
+
+template <typename T, int K, int CB>
+static void launch_grouped_gemm(const MoeGroupedGemmArgs<T>& a, const fp16* lut, sycl::queue& q) {
+    constexpr int MR = 8;
+    constexpr int NT = nt_of(K, MR);
+    const int n = a.units * a.n_strips * a.P;
+    GroupedGemmFusedKernel<T, K, CB, MR, NT> k{a, lut};
+    const int local = 8;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k);
+    });
+}
+
+}  // namespace exl3
+
+at::Tensor exl3_moe_grouped_gemm(at::Tensor x, at::Tensor tr_arena, at::Tensor suh_arena,
+                                 at::Tensor svh_arena, at::Tensor expert_ids, at::Tensor shard,
+                                 at::Tensor m_per_unit, at::Tensor x_offsets, at::Tensor out_offsets,
+                                 int64_t total_out_tokens, int64_t nslots, int64_t N, int64_t K, int64_t cb) {
+    TORCH_CHECK(x.dim() == 2,
+                "exl3_moe_grouped_gemm: x must be [total_in_tokens, Kdim], got ", x.dim(), "D");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
+                "exl3_moe_grouped_gemm: expected fp16/bf16 x, got ", x.scalar_type());
+    TORCH_CHECK(tr_arena.scalar_type() == at::kShort && tr_arena.is_contiguous(),
+                "exl3_moe_grouped_gemm: trellis must be contiguous int16");
+    TORCH_CHECK(tr_arena.dim() == 5 && tr_arena.size(4) == 16 * K,
+                "exl3_moe_grouped_gemm: trellis arena must be [E, nslots, r, tn, 16K]");
+    TORCH_CHECK(tr_arena.size(1) == nslots && suh_arena.size(1) == nslots
+                    && svh_arena.size(1) == nslots,
+                "exl3_moe_grouped_gemm: nslots mismatch");
+    TORCH_CHECK(svh_arena.size(2) == N, "exl3_moe_grouped_gemm: svh N mismatch");
+    TORCH_CHECK(shard.dim() == 1 && shard.size(0) == N / 128,
+                "exl3_moe_grouped_gemm: shard_of_nb must be [N/128]");
+    TORCH_CHECK(suh_arena.scalar_type() == at::kHalf && svh_arena.scalar_type() == at::kHalf,
+                "exl3_moe_grouped_gemm: suh/svh are fp16 weights");
+    TORCH_CHECK(expert_ids.scalar_type() == at::kInt && expert_ids.is_contiguous(),
+                "exl3_moe_grouped_gemm: expert_ids must be contiguous int32");
+    TORCH_CHECK(m_per_unit.scalar_type() == at::kInt && m_per_unit.is_contiguous(),
+                "exl3_moe_grouped_gemm: m_per_unit must be contiguous int32");
+    TORCH_CHECK(x_offsets.scalar_type() == at::kInt && x_offsets.is_contiguous(),
+                "exl3_moe_grouped_gemm: x_offsets must be contiguous int32");
+    TORCH_CHECK(out_offsets.scalar_type() == at::kInt && out_offsets.is_contiguous(),
+                "exl3_moe_grouped_gemm: out_offsets must be contiguous int32");
+
+    const int units = (int)expert_ids.size(0);
+    auto opts = x.options();
+
+    if (units == 0 || total_out_tokens == 0) {
+        if (nslots == 2) return at::zeros({2, total_out_tokens, N}, opts);
+        return at::zeros({total_out_tokens, N}, opts);
+    }
+
+    const int E       = (int)tr_arena.size(0);
+    const int Kdim    = (int)x.size(1);
+    const int tiles_n = (int)tr_arena.size(3);
+    constexpr int MR  = 8;
+    const int NT      = nt_of(K, MR);
+
+    const int TK = Kdim / 16;
+    int n_strips = tiles_n / NT;
+    int P = std::max(1, std::min(TK / 8, (g_target_threads + n_strips - 1) / n_strips));
+    int rps = ((TK + P - 1) / P + 7) / 8 * 8;
+    P = (TK + rps - 1) / rps;
+
+    at::Tensor out;
+    int out_slot_st = 0;
+    if (nslots == 2) {
+        out = at::empty({2, total_out_tokens, N}, opts);
+        out_slot_st = (int)total_out_tokens * (int)N;
+    } else {
+        out = at::empty({total_out_tokens, N}, opts);
+        out_slot_st = 0;
+    }
+
+    auto part     = at::empty({units, P, MR, N}, opts.dtype(at::kFloat));
+    auto counters = at::zeros({units, N / 128}, opts.dtype(at::kInt));
+
+    const int tr_total      = (int)(tr_arena.numel() / 2);
+    const int tr_expert_st  = tr_total / E;
+    const int tr_slot_st    = tr_total / (E * (int)nslots);
+    const int suh_expert_st = (int)(suh_arena.numel() / E);
+    const int suh_slot_st   = (int)(suh_arena.numel() / (E * (int)nslots));
+    const int svh_expert_st = (int)(svh_arena.numel() / E);
+    const int svh_slot_st   = (int)(svh_arena.numel() / (E * (int)nslots));
+    const int cnt_unit_st   = (int)(N / 128);
+    const int part_unit_st  = P * MR * (int)N;
+
+    auto& q = queue_of(x);
+    const fp16* lut = nullptr;
+#ifdef EXL3_LUT
+    lut = lut_for((int)cb, x, q);
+#endif
+
+    auto run = [&](auto tag) {
+        using T = decltype(tag);
+        MoeGroupedGemmArgs<T> a{
+            reinterpret_cast<const T*>(x.data_ptr()), (int)x.stride(0),
+            reinterpret_cast<const uint32_t*>(tr_arena.data_ptr()), tr_expert_st, tr_slot_st,
+            reinterpret_cast<const fp16*>(suh_arena.data_ptr()), suh_expert_st, suh_slot_st,
+            reinterpret_cast<const fp16*>(svh_arena.data_ptr()), svh_expert_st, svh_slot_st,
+            reinterpret_cast<T*>(out.data_ptr()), out_slot_st,
+            reinterpret_cast<const int*>(expert_ids.data_ptr()),
+            reinterpret_cast<const int*>(shard.data_ptr()),
+            reinterpret_cast<const int*>(m_per_unit.data_ptr()),
+            reinterpret_cast<const int*>(x_offsets.data_ptr()),
+            reinterpret_cast<const int*>(out_offsets.data_ptr()),
+            reinterpret_cast<uint32_t*>(counters.data_ptr()), cnt_unit_st,
+            reinterpret_cast<float*>(part.data_ptr()), part_unit_st,
+            (int)nslots, Kdim, (int)N, tiles_n, rps, n_strips, P, units};
+        if (K == 3 && cb == 1)      launch_grouped_gemm<T, 3, 1>(a, lut, q);
+        else if (K == 4 && cb == 1) launch_grouped_gemm<T, 4, 1>(a, lut, q);
+        else if (K == 6 && cb == 1) launch_grouped_gemm<T, 6, 1>(a, lut, q);
+        else if (K == 4 && cb == 2) launch_grouped_gemm<T, 4, 2>(a, lut, q);
+        else if (K == 6 && cb == 2) launch_grouped_gemm<T, 6, 2>(a, lut, q);
+        else TORCH_CHECK(false, "exl3_moe_grouped_gemm: unsupported K/codebook ", K, "/", cb);
+    };
+    if (x.scalar_type() == at::kHalf) run(fp16{});
+    else run(sycl::ext::oneapi::bfloat16{});
+    return out;
+}
