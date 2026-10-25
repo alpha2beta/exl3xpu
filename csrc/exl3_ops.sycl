@@ -849,7 +849,7 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
     m.def("exl3_moe_grouped_gemv(Tensor x, Tensor tr_arena, Tensor suh_arena, Tensor svh_arena, Tensor expert_ids, Tensor shard, int nslots, int N, int K, int cb, int x_unit_stride) -> Tensor");
     m.impl("exl3_moe_grouped_gemv", torch::kXPU, &exl3_moe_grouped_gemv);
-    m.def("exl3_moe_grouped_gemm(Tensor x, Tensor tr_arena, Tensor suh_arena, Tensor svh_arena, Tensor expert_ids, Tensor shard, Tensor m_per_unit, Tensor x_offsets, Tensor out_offsets, int total_out_tokens, int nslots, int N, int K, int cb) -> Tensor");
+    m.def("exl3_moe_grouped_gemm(Tensor x, Tensor tr_arena, Tensor suh_arena, Tensor svh_arena, Tensor expert_ids, Tensor shard, Tensor m_per_unit, Tensor x_offsets, Tensor out_offsets, int total_out_tokens, int nslots, int N, int K, int cb, int max_m=8) -> Tensor");
     m.impl("exl3_moe_grouped_gemm", torch::kXPU, &exl3_moe_grouped_gemm);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
     m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);

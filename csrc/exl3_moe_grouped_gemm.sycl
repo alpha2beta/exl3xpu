@@ -225,9 +225,8 @@ struct GroupedGemmFusedKernel {
     }
 };
 
-template <typename T, int K, int CB>
+template <typename T, int K, int CB, int MR>
 static void launch_grouped_gemm(const MoeGroupedGemmArgs<T>& a, const fp16* lut, sycl::queue& q) {
-    constexpr int MR = 8;
     constexpr int NT = nt_of(K, MR);
     const int n = a.units * a.n_strips * a.P;
     GroupedGemmFusedKernel<T, K, CB, MR, NT> k{a, lut};
@@ -242,7 +241,8 @@ static void launch_grouped_gemm(const MoeGroupedGemmArgs<T>& a, const fp16* lut,
 at::Tensor exl3_moe_grouped_gemm(at::Tensor x, at::Tensor tr_arena, at::Tensor suh_arena,
                                  at::Tensor svh_arena, at::Tensor expert_ids, at::Tensor shard,
                                  at::Tensor m_per_unit, at::Tensor x_offsets, at::Tensor out_offsets,
-                                 int64_t total_out_tokens, int64_t nslots, int64_t N, int64_t K, int64_t cb) {
+                                 int64_t total_out_tokens, int64_t nslots, int64_t N, int64_t K, int64_t cb,
+                                 int64_t max_m) {
     TORCH_CHECK(x.dim() == 2,
                 "exl3_moe_grouped_gemm: x must be [total_in_tokens, Kdim], got ", x.dim(), "D");
     TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
@@ -279,7 +279,7 @@ at::Tensor exl3_moe_grouped_gemm(at::Tensor x, at::Tensor tr_arena, at::Tensor s
     const int E       = (int)tr_arena.size(0);
     const int Kdim    = (int)x.size(1);
     const int tiles_n = (int)tr_arena.size(3);
-    constexpr int MR  = 8;
+    const int MR      = (max_m > 8) ? 16 : 8;
     const int NT      = nt_of(K, MR);
 
     const int TK = Kdim / 16;
@@ -333,12 +333,21 @@ at::Tensor exl3_moe_grouped_gemm(at::Tensor x, at::Tensor tr_arena, at::Tensor s
             reinterpret_cast<uint32_t*>(counters.data_ptr()), cnt_unit_st,
             reinterpret_cast<float*>(part.data_ptr()), part_unit_st,
             (int)nslots, Kdim, (int)N, tiles_n, rps, n_strips, P, units};
-        if (K == 3 && cb == 1)      launch_grouped_gemm<T, 3, 1>(a, lut, q);
-        else if (K == 4 && cb == 1) launch_grouped_gemm<T, 4, 1>(a, lut, q);
-        else if (K == 6 && cb == 1) launch_grouped_gemm<T, 6, 1>(a, lut, q);
-        else if (K == 4 && cb == 2) launch_grouped_gemm<T, 4, 2>(a, lut, q);
-        else if (K == 6 && cb == 2) launch_grouped_gemm<T, 6, 2>(a, lut, q);
-        else TORCH_CHECK(false, "exl3_moe_grouped_gemm: unsupported K/codebook ", K, "/", cb);
+        if (MR == 8) {
+            if (K == 3 && cb == 1)      launch_grouped_gemm<T, 3, 1, 8>(a, lut, q);
+            else if (K == 4 && cb == 1) launch_grouped_gemm<T, 4, 1, 8>(a, lut, q);
+            else if (K == 6 && cb == 1) launch_grouped_gemm<T, 6, 1, 8>(a, lut, q);
+            else if (K == 4 && cb == 2) launch_grouped_gemm<T, 4, 2, 8>(a, lut, q);
+            else if (K == 6 && cb == 2) launch_grouped_gemm<T, 6, 2, 8>(a, lut, q);
+            else TORCH_CHECK(false, "exl3_moe_grouped_gemm: unsupported K/codebook ", K, "/", cb);
+        } else {
+            if (K == 3 && cb == 1)      launch_grouped_gemm<T, 3, 1, 16>(a, lut, q);
+            else if (K == 4 && cb == 1) launch_grouped_gemm<T, 4, 1, 16>(a, lut, q);
+            else if (K == 6 && cb == 1) launch_grouped_gemm<T, 6, 1, 16>(a, lut, q);
+            else if (K == 4 && cb == 2) launch_grouped_gemm<T, 4, 2, 16>(a, lut, q);
+            else if (K == 6 && cb == 2) launch_grouped_gemm<T, 6, 2, 16>(a, lut, q);
+            else TORCH_CHECK(false, "exl3_moe_grouped_gemm: unsupported K/codebook ", K, "/", cb);
+        }
     };
     if (x.scalar_type() == at::kHalf) run(fp16{});
     else run(sycl::ext::oneapi::bfloat16{});

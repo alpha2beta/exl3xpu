@@ -58,6 +58,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: EXL3 codebook name -> numeric id used by the kernels and the checkpoint.
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
 
+try:
+    from vllm_xpu_kernels import _moe_C  # noqa: F401
+
+    _HAS_MOE_C = (
+        hasattr(torch.ops, "_moe_C")
+        and hasattr(torch.ops._moe_C, "remap_hidden_states")
+        and hasattr(torch.ops._moe_C, "moe_gather")
+    )
+except Exception:
+    _HAS_MOE_C = False
+
 #: Projections every routed expert must provide in this checkpoint schema.
 CHECKPOINT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
@@ -1191,71 +1202,113 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         try:
             T, k = topk_ids.shape
             dev = x2.device
-            flat_ids = topk_ids.reshape(-1)
-            if flat_ids.dtype != torch.int32:
-                flat_ids = flat_ids.to(torch.int32)
-            flat_weights = weights.reshape(-1)
-            flat_token_ids = (
-                torch.arange(T, device=dev, dtype=torch.int32)
-                .unsqueeze(1)
-                .expand(T, k)
-                .reshape(-1)
-            )
+            E = self.num_local_experts
 
-            # Sort assignments on device
-            sort_order = torch.argsort(flat_ids)
-            sorted_expert_ids = flat_ids[sort_order]
-            sorted_token_ids = flat_token_ids[sort_order]
-            sorted_weights = flat_weights[sort_order]
+            if _HAS_MOE_C:
+                remapped_x = torch.empty(
+                    (T * k, self.hidden_size), dtype=x2.dtype, device=dev
+                )
+                rows_per_expert = torch.zeros(E, dtype=torch.int32, device=dev)
+                unperm = torch.empty((T, k), dtype=torch.int32, device=dev)
+                ids_i32 = (
+                    topk_ids.to(torch.int32)
+                    if topk_ids.dtype != torch.int32
+                    else topk_ids
+                )
 
-            # Gather x according to sorted token assignments
-            x_sorted = x2.index_select(0, sorted_token_ids)
+                torch.ops._moe_C.remap_hidden_states(
+                    x2,
+                    None,
+                    remapped_x,
+                    None,
+                    None,
+                    rows_per_expert,
+                    unperm,
+                    ids_i32,
+                    E,
+                    E,
+                )
+                active_mask = rows_per_expert > 0
+                active_experts = torch.nonzero(active_mask).squeeze(-1).to(torch.int32)
+                U = active_experts.shape[0]
+                if U == 0:
+                    return torch.zeros_like(x2)
 
-            # Identify contiguous expert slices
-            unique_experts, counts = torch.unique_consecutive(
-                sorted_expert_ids, return_counts=True
-            )
-            unique_experts = unique_experts.to(torch.int32)
-            counts = counts.to(torch.int32)
-            U = unique_experts.shape[0]
-            if U == 0:
-                return torch.zeros_like(x2)
+                counts = rows_per_expert[active_experts]
+                all_offsets = torch.zeros(E, dtype=torch.int32, device=dev)
+                all_offsets[1:] = torch.cumsum(rows_per_expert[:-1], dim=0)
+                offsets = all_offsets[active_experts]
+                x_sorted = remapped_x
+                total_tokens = T * k
+            else:
+                flat_ids = topk_ids.reshape(-1)
+                if flat_ids.dtype != torch.int32:
+                    flat_ids = flat_ids.to(torch.int32)
+                flat_weights = weights.reshape(-1)
+                flat_token_ids = (
+                    torch.arange(T, device=dev, dtype=torch.int32)
+                    .unsqueeze(1)
+                    .expand(T, k)
+                    .reshape(-1)
+                )
 
-            offsets = torch.zeros(U, dtype=torch.int32, device=dev)
-            offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+                # Sort assignments on device
+                sort_order = torch.argsort(flat_ids)
+                sorted_expert_ids = flat_ids[sort_order]
+                sorted_token_ids = flat_token_ids[sort_order]
+                sorted_weights = flat_weights[sort_order]
+
+                # Gather x according to sorted token assignments
+                x_sorted = x2.index_select(0, sorted_token_ids)
+
+                # Identify contiguous expert slices
+                active_experts, counts = torch.unique_consecutive(
+                    sorted_expert_ids, return_counts=True
+                )
+                active_experts = active_experts.to(torch.int32)
+                counts = counts.to(torch.int32)
+                U = active_experts.shape[0]
+                if U == 0:
+                    return torch.zeros_like(x2)
+
+                offsets = torch.zeros(U, dtype=torch.int32, device=dev)
+                offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+                total_tokens = x_sorted.shape[0]
 
             inter = self.intermediate_size_per_partition
             shard13 = self._shard_of_nb(dev, inter)
             shard2 = self._shard_of_nb(dev, self.hidden_size)
-            total_tokens = x_sorted.shape[0]
 
-            # If any expert has M > 8, chunk them into units with M <= 8
-            # so the grouped kernel handles 100% of tokens in a unified launch
-            # without requiring slow eager linear fallbacks.
-            if (counts > 8).any():
+            # Vector tile selection (MR=8 or MR=16):
+            # For Arc 140V (8 Xe2 cores, 64 Vector Engines), MR=8 provides twice
+            # the concurrent thread occupancy per subslice. Only switch to MR=16
+            # when the majority of active experts have >8 tokens (T >= 512).
+            gt8_count = (counts > 8).sum().item()
+            max_m_target = 16 if (gt8_count > U // 2) else 8
+            if (counts > max_m_target).any():
                 chunk_exp = []
                 chunk_cnt = []
                 chunk_off = []
                 for exp, cnt, off in zip(
-                    unique_experts.tolist(), counts.tolist(), offsets.tolist()
+                    active_experts.tolist(), counts.tolist(), offsets.tolist()
                 ):
-                    while cnt > 8:
+                    while cnt > max_m_target:
                         chunk_exp.append(exp)
-                        chunk_cnt.append(8)
+                        chunk_cnt.append(max_m_target)
                         chunk_off.append(off)
-                        off += 8
-                        cnt -= 8
+                        off += max_m_target
+                        cnt -= max_m_target
                     chunk_exp.append(exp)
                     chunk_cnt.append(cnt)
                     chunk_off.append(off)
-                unique_experts = torch.tensor(
+                active_experts = torch.tensor(
                     chunk_exp, dtype=torch.int32, device=dev
                 )
                 counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
                 offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
-                U = unique_experts.shape[0]
+                U = active_experts.shape[0]
 
-            ids13 = unique_experts.repeat_interleave(2)
+            ids13 = active_experts.repeat_interleave(2)
             m13 = counts.repeat_interleave(2)
             off13 = offsets.repeat_interleave(2)
 
@@ -1274,6 +1327,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 inter,
                 self.K,
                 self.cb,
+                max_m_target,
             )
             act = (F.silu(gu[0]) * gu[1]).contiguous()
             dn = torch.ops.exl3xpu_C.exl3_moe_grouped_gemm(
@@ -1281,7 +1335,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 layer.w2_trellis,
                 layer.w2_suh,
                 layer.w2_svh,
-                unique_experts,
+                active_experts,
                 shard2,
                 counts,
                 offsets,
@@ -1291,14 +1345,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 self.hidden_size,
                 self.K,
                 self.cb,
+                max_m_target,
             )
 
             # Scatter-add weighted outputs back to original token positions
-            out = torch.zeros((T, self.hidden_size), dtype=torch.float32, device=dev)
-            out.index_add_(
-                0, sorted_token_ids, dn.to(torch.float32) * sorted_weights.unsqueeze(-1)
-            )
-            return out.to(x2.dtype)
+            if _HAS_MOE_C:
+                out = torch.empty((T, self.hidden_size), dtype=x2.dtype, device=dev)
+                w_f32 = (
+                    weights.to(torch.float32)
+                    if weights.dtype != torch.float32
+                    else weights
+                )
+                torch.ops._moe_C.moe_gather(out, dn, w_f32, unperm, E)
+                return out
+            else:
+                out = torch.zeros(
+                    (T, self.hidden_size), dtype=torch.float32, device=dev
+                )
+                out.index_add_(
+                    0,
+                    sorted_token_ids,
+                    dn.to(torch.float32) * sorted_weights.unsqueeze(-1),
+                )
+                return out.to(x2.dtype)
         except Exception:
             self._grouped_gemm_supported = False
             return None
