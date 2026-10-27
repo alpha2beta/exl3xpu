@@ -77,6 +77,15 @@ CHECKPOINT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _PATH_SEEN: set[str] = set()
 _TRACE_PATHS: bool | None = None
 
+# Largest prefill size P4-03's MR=4 tile may serve (§13.11, layer-0 A/B).
+# Above an expert holds enough rows that chunking it into 4-row sub-units
+# re-reads its trellis more times than the grouped launch saves. Measured
+# crossover against the device-binned eager path: grouped wins at
+# T ∈ {16,32,64} (10.95/15.79/23.88 vs 13.18/18.43/25.61 ms/layer) and loses
+# from T=128 (36.48 vs 31.67) onward; at T=4096 the eager loop is 2.4x faster
+# than the un-gated grouped path (111 vs 464 tok/s end to end).
+_PREFILL_GEMM_MAX_T = 64
+
 
 def _trace_path(name: str, detail: str = "") -> None:
     global _TRACE_PATHS
@@ -1284,6 +1293,71 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             stacklevel=2,
         )
 
+    # -- eager fallback with the per-expert host syncs removed (§13.11) --------
+    def _eager_prefill_batched(
+        self,
+        layer: "RoutedExperts",
+        x2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """P2-01 eager routed-expert math, binning on device (one host sync).
+
+        The generic fallback does ``torch.unique(ids).tolist()`` and then a
+        ``(ids == e).nonzero()`` **per active expert** — 257 host syncs per
+        layer with ~256 active experts, ~82 ms/layer, i.e. the ``A`` term that
+        §13.7 measured as 39 % of prefill time at ``BATCHED_TOKENS=4096``.
+
+        Here ``remap_hidden_states`` lays the ``T*k`` assignments out
+        expert-major and reports ``rows_per_expert``, so a **single**
+        ``.tolist()`` on that array supplies every expert's row count. The
+        arithmetic is unchanged: the same per-expert ``_expert_mlp_cached`` over the same
+        rows, assembled with the same ``moe_gather`` the P4-03 path uses — so
+        results stay within the V-2/V-5 tolerance of ``apply()``'s reference
+        loop (different fp32 accumulation order only).
+
+        Returns ``None`` when the device binning op is unavailable, so callers
+        keep the original per-expert loop as the fallback.
+        """
+        if not _HAS_MOE_C:
+            return None
+        T, k = topk_ids.shape
+        dev = x2.device
+        E = self.num_local_experts
+        total = T * k
+        ids_i32 = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+
+        x_sorted = torch.empty((total, self.hidden_size), dtype=x2.dtype, device=dev)
+        rows_per_expert = torch.zeros(E, dtype=torch.int32, device=dev)
+        unperm = torch.empty((T, k), dtype=torch.int32, device=dev)
+        torch.ops._moe_C.remap_hidden_states(
+            x2, None, x_sorted, None, None,
+            rows_per_expert, unperm, ids_i32, E, E,
+        )
+
+        counts = rows_per_expert.tolist()          # the only host sync
+        if not any(counts):
+            return None
+
+        offsets: list[int] = []
+        off = 0
+        for c in counts:
+            offsets.append(off)
+            off += c
+
+        # Expert-major outputs, exactly the layout moe_gather expects.
+        dn = torch.empty((total, self.hidden_size), dtype=x2.dtype, device=dev)
+        for e, c in enumerate(counts):
+            if c == 0:
+                continue
+            o = offsets[e]
+            dn[o : o + c] = self._expert_mlp_cached(e, x_sorted[o : o + c])
+
+        out = torch.empty((T, self.hidden_size), dtype=x2.dtype, device=dev)
+        w_f32 = weights if weights.dtype == torch.float32 else weights.to(torch.float32)
+        torch.ops._moe_C.moe_gather(out, dn, w_f32, unperm, E)
+        return out
+
     # -- P4-03: grouped small-M prefill path ----------------------------------
     def _grouped_mlp_prefill(
         self,
@@ -1302,6 +1376,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         import torch.nn.functional as F
 
         if getattr(self, "_grouped_gemm_supported", None) is False:
+            return None
+        # §13.11: MR=4 (the Xe2 GRF budget, §13.9) splits an expert into
+        # ceil(cnt/4) sub-units that each re-read that expert's full trellis.
+        # Measured: grouped wins for T<=256 (1.9-3.1x on layer 0, where cnt<=8
+        # makes that a <=2x re-read) and loses badly at production T=4096,
+        # where cnt~128 means a 32x re-read — 111 vs 464 tok/s end to end.
+        # Gate on T: sync-free, and T>128 cannot be serviced anyway (pigeonhole
+        # over 256 experts with top-8 forces some cnt>4 at T>=129).
+        if x2.shape[0] > _PREFILL_GEMM_MAX_T:
+            _trace_path("prefill-eager-gated", f" T={x2.shape[0]}")
             return None
         if not hasattr(torch.ops.exl3xpu_C, "exl3_moe_grouped_gemm"):
             self._grouped_gemm_supported = False
@@ -1607,6 +1691,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     f"exl3: MoE {self.prefix}: routing index outside "
                     f"[0, {self.num_local_experts})"
                 )
+
+        if self._debug_capture is None and topk_ids.numel():
+            # §13.11: device-side binning — one host sync instead of 257. The
+            # arithmetic matches the loop below (same per-expert
+            # _expert_mlp_cached, same moe_gather assembly); if the binning ops
+            # are unavailable it returns None and we keep the original loop.
+            y = self._eager_prefill_batched(layer, x2, topk_ids, weights)
+            if y is not None:
+                _trace_path("eager-batched", f" tokens={tokens}")
+                return y.reshape(x.shape)
 
         for expert_id in torch.unique(topk_ids).tolist():
             token_idx, slot_idx = (topk_ids == expert_id).nonzero(as_tuple=True)
