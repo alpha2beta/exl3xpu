@@ -88,8 +88,8 @@ Four execution paths, chosen per call by `apply()`'s dispatch ladder:
 |---|---|---|---|
 | **P4-02** grouped decode GEMV (`csrc/exl3_moe_gemv.sycl`) | `T = 1` | 2 launches (gate+up, down), routing stays on device, **zero host syncs** | certified, bit-exact |
 | **§11.5** token-parallel verify | `1 < T <= 4` | 2 launches — the same kernel with a per-unit `x_unit_stride`, so a T-token verify batch is `T*k` independent M=1 units | certified, bit-exact |
-| **P4-03** grouped prefill GEMM (`csrc/exl3_moe_grouped_gemm.sycl`) | `T >= 5` | 2 launches, MR=4 tiles, split-K scratch | **numerics certified, out of service on performance** (below) |
-| **P4-01/P2-01** eager loop | anything else | one Python round per active expert (three fused linears each) + a routing sync | correct — the serving default for MoE prefill |
+| **P4-03** grouped prefill GEMM (`csrc/exl3_moe_grouped_gemm.sycl`) | 5 < `T` ≤ 64 (gated by `_PREFILL_GEMM_MAX_T`) | 2 launches, MR=4 tiles, split-K scratch | **numerics certified; wins only ≤64, refused above by design** (below) |
+| **P4-01/P2-01** eager path | anything else | **device binning → one host sync**, then 3 fused linears per active expert | correct — the serving default for `T > 64`, `_eager_prefill_batched` |
 
 Both grouped kernels dispatch the same five combinations: `K ∈ {3,4,6}` with MCG (`cb=1`) and
 `K ∈ {4,6}` with mul1 (`cb=2`) — what the 3.09 and 4.0 bpw checkpoints use. Anything else (including the
@@ -130,18 +130,30 @@ units instead of an MR=8-padded prefill GEMM with per-layer host syncs.
 
 ### P4-03 prefill is deliberately not in service
 
-Three defects have been found in this path. The first two are **fixed** (commit `a46d417`, October 27); the third was introduced by that fix and is what keeps the path out of service today.
+Three defects were found in this path. The first two are fixed in `a46d417`; the third was introduced by that fix and is now closed by `dee02ae` (gate + batched eager path). Current state: **P4-03 serves T ≤ 64 only, by design, and prefill above that uses the device-binned eager path.**
 
 1. **JIT failure — fixed.** The SYCL JIT failed on the first multi-token call (`RuntimeError: The program was built for 1 devices`, root cause `LLVM ERROR: VISA builder API call failed … Compiler error emitted in code generator`), and `_grouped_mlp_prefill`'s `except` latched `_grouped_gemm_supported` off for that layer — permanently, silently. Root cause: the `MR=16` instantiations, whose accumulator is `16 × 4 × 2 × 32 = 4,096 floats = 16,384 B` — twice the 8 KB GRF, refused by the register allocator (`V4078`). Those instantiations are gone.
 2. **Numerics outside K=3/cb=1 — fixed.** The output was 17-28 % off the certified `exl3_linear` path at every M in 1..8, including a single row at offset 0 (arithmetic, not row layout). Two causes: `MR=8` sat exactly at the 8,192 B register limit and spilled the accumulator, and the split-K `part` stores were L1 write-back while `had_out` read past L1 with no clean fence, so cross-EU partials went stale. Fixed with `MR=4` (7,168 B of vector state) plus `cache_hint_L1<write_through>` on the `part` store and `fence<…, flush_op::clean>` before the split-K arrival. Verified by `tests/test_grouped_verify.py --strict`: **50/50**, worst relative error 1.8e-3 (T=64), T=4 effectively bit-exact.
-3. **Performance — open, and the current reason the path stays off.** The same commit pinned `MR = 4` and Python chunking to `max_m_target = 4`. At production prefill sizes each expert holds `cnt ≈ 128` rows (T=4096, top-8 over 256 experts), so each expert is split into **32 sub-units that each re-read that expert's full trellis** — 32× the weight traffic instead of 1× unchunked — while the eager loop amortizes the same weights across all 128 rows. Measured A/B, identical config and prompts, both paths proven by `EXL3_TRACE_PATHS`:
+3. **Performance — fixed in `dee02ae`; it was the reason the path had to stay off.** `a46d417` pinned `MR = 4` and Python chunking to `max_m_target = 4`, and at production prefill sizes each expert holds `cnt ≈ 128` rows (T=4096, top-8 over 256 experts) — so each expert was split into **32 sub-units that each re-read its trellis**, 32× the weight traffic instead of 1× unchunked, while the eager loop amortizes the same weights across all 128 rows. Measured A/B, identical config and prompts, both paths proven by `EXL3_TRACE_PATHS`:
 
    | prompt | P4-03 engaged | eager loop |
    |---|---|---|
    | ~13,000 tokens | 118.4 s → 111 tok/s | 26.1 s → **464 tok/s** |
    | ~2,700-2,900 tokens | 25.7 s → 113 tok/s | 8.6 s → **307 tok/s** |
 
-   i.e. **2.7-4.6× slower than the loop it replaces** (≈900 vs ≈220 ms/layer at T=4096). Layer-0 numbers showing 1.9-3.1× wins cover only T ≤ 256, where `cnt ≤ 8` and the chunking creates at most two sub-units; the crossover lies between T=256 and T=4096. Re-tile rather than un-pin: `MR=4` is required for correctness at K=4 (§2 above), so the tile shape — not the constant — has to change.
+   i.e. **2.7-4.6× slower than the loop it replaces** (≈900 vs ≈220 ms/layer at T=4096). The layer-0 numbers showing 1.9-3.1× wins were measured against that same old eager loop *still paying its per-expert syncs*, so they could not see either effect. `MR=4` itself cannot simply be un-pinned — it is what keeps K=4/cb=2 inside the register budget (§2) — so the tile had to be *bounded*, not widened.
+
+   **Fix (both in `moe.py`, no rebuild):**
+   * P4-03 gated on `T ≤ _PREFILL_GEMM_MAX_T` (64) with a sync-free `T` test — the layer-0 crossover: grouped wins at T=16/32/64 (10.95/15.79/23.88 vs 13.18/18.43/25.61 ms/layer) and loses from T=128 (36.48 vs 31.67).
+   * `_eager_prefill_batched`: P2-01 math with device-side binning — one `.tolist()` on `remap_hidden_states`' `rows_per_expert` replaces `torch.unique` plus a `(ids == e).nonzero()` per expert (257 host syncs/layer, the `A` term quantified below). Same per-expert `_expert_mlp_cached`, same `moe_gather` assembly, so numerics are unchanged.
+
+   | state | ~12,000-token prompt | ~2,650-token prompt |
+   |---|---|---|
+   | broken grouped (`a46d417`) | 111.4 tok/s | 112.8 tok/s |
+   | old eager loop | 464.0 tok/s | 306.8 tok/s |
+   | **fixed (`dee02ae`)** | **785.4 tok/s** | **570.8 tok/s** |
+
+   **+69 % over the old eager loop, 7.1× over the broken path**, and within 2 % of the ~770 tok/s floor predicted below — the estimate below was right, P4-03 was simply the wrong vehicle for it.
 
 **What being down costs in prompt processing.** A/B on `--max-num-batched-tokens` alone: same card and
 checkpoint, identical `KV_CACHE_BYTES` (both legs report a 107,240-token KV cache) and `MAX_LEN=16384`,
@@ -162,7 +174,7 @@ So the eager loop wastes **39 % of prefill time at `BATCHED_TOKENS=4096`** (472 
 
 Practical corollary while it stays down: keep `--max-num-batched-tokens` large — small chunks are disproportionately expensive (126 vs 473 tok/s on the same prompt).
 
-**Fix direction, in order:** (a) gate P4-03 on `max(cnt) <= max_m_target` so it only runs when it doesn't need to chunk (it wins 2.26× at T=128); (b) remove the eager loop's per-expert `torch.unique` + `nonzero` syncs — `_HAS_MOE_C.remap_hidden_states` already yields `rows_per_expert`/offsets on device, so one `.tolist()` replaces ~256 of the 257 syncs, with no numerics risk and no kernel change; (c) re-tile `(MR, NT)` under the register budget (e.g. halve `NT` so MR=8's accumulator returns to 7,168 B) so `cnt/MR` sub-units shrink from 32 to 16.
+**Fix applied (`dee02ae`).** (a) P4-03 is gated to `T ≤ 64`; (b) the eager path is device-binned (`_eager_prefill_batched`); (c) re-tiling `(MR, NT)` is **superseded** — once the eager path stops paying 257 syncs, the grouped launch has no advantage left to win back, and re-tiling would put the numerics at risk for nothing. Operational advice while anything else changes: keep `--max-num-batched-tokens` large, and re-measure any future P4-03 tuning against the *batched* path, not the old loop (the 1.9-3.1× figures in `mtp_moe.md` §13.9 were measured against a baseline 2.4-2.6× slower than today's.)
 
 ### Tracing and testing MoE paths
 
@@ -293,12 +305,13 @@ images read back in order), video and a 128K needle test pass. Open items: 254K 
 (~80 TFLOPS fp16; int8 QK^T is the next step); at C16 with thinking on ~14 of 16 streams fit the KV pool.
 Log in `docs/PROGRESS.md`.
 
-MoE open items: P4-03's two original defects are **fixed** (`a46d417`: the `MR=16` GRF/JIT overflow and the
-K=4/cb=2 numerics — `tests/test_grouped_verify.py --strict` now passes 50/50 with the path genuinely
-exercised). A third defect was introduced by that fix and is the open one: pinning `MR = 4` splits each
-expert into `cnt/4` sub-units that re-read its trellis, so at production chunk sizes P4-03 runs
-**2.7–4.6× slower than the eager loop** (111 vs 464 tok/s, see "P4-03 prefill is deliberately not in
-service"). The `K/cb` refusal was removed by the same commit, so **the current tree runs P4-03 in
-serving** and should be re-gated until the tiling/host-op fix lands. The MoE paths are validated on
+MoE open items: all three P4-03 defects are closed — the `MR=16` GRF/JIT overflow and the K=4/cb=2
+numerals in `a46d417` (`tests/test_grouped_verify.py --strict` 50/50, path genuinely exercised), and the
+performance regression that fix introduced in `dee02ae` (P4-03 gated to `T ≤ 64` at the measured
+crossover, plus a device-binned eager path that replaces 257 host syncs/layer with one). Prefill at
+`BATCHED_TOKENS=4096` measures **785.4 tok/s** on a 12,099-token prompt, +69 % over the old eager loop and
+7.1× over the broken grouped path. Remaining MoE work is optional: a register-budget-aware `(MR, NT)`
+re-tile is *superseded* (the batched eager path already beats grouped everywhere above T=64), and the
+fixture checkpoint for the legacy P4 suite still needs pinning. The MoE paths are validated on
 Arc 140V / vLLM 0.31.0 XPU with TP=1 and `enforce-eager`; they have not been re-run on the B70 / 0.26.1
 recipe above, and tensor parallelism is still unsupported for MoE as for dense.
