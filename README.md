@@ -88,7 +88,7 @@ Four execution paths, chosen per call by `apply()`'s dispatch ladder:
 |---|---|---|---|
 | **P4-02** grouped decode GEMV (`csrc/exl3_moe_gemv.sycl`) | `T = 1` | 2 launches (gate+up, down), routing stays on device, **zero host syncs** | certified, bit-exact |
 | **§11.5** token-parallel verify | `1 < T <= 4` | 2 launches — the same kernel with a per-unit `x_unit_stride`, so a T-token verify batch is `T*k` independent M=1 units | certified, bit-exact |
-| **P4-03** grouped prefill GEMM (`csrc/exl3_moe_grouped_gemm.sycl`) | `T >= 5` | 2 launches, MR=8/16 tiles, split-K scratch | **not certified, not in service** (below) |
+| **P4-03** grouped prefill GEMM (`csrc/exl3_moe_grouped_gemm.sycl`) | `T >= 5` | 2 launches, MR=4 tiles, split-K scratch | **numerics certified, out of service on performance** (below) |
 | **P4-01/P2-01** eager loop | anything else | one Python round per active expert (three fused linears each) + a routing sync | correct — the serving default for MoE prefill |
 
 Both grouped kernels dispatch the same five combinations: `K ∈ {3,4,6}` with MCG (`cb=1`) and
@@ -130,18 +130,18 @@ units instead of an MR=8-padded prefill GEMM with per-layer host syncs.
 
 ### P4-03 prefill is deliberately not in service
 
-Two defects, stacked so the first hides the second:
+Three defects have been found in this path. The first two are **fixed** (commit `a46d417`, October 27); the third was introduced by that fix and is what keeps the path out of service today.
 
-1. **It never runs in serving.** The SYCL JIT fails on the first multi-token call
-   (`RuntimeError: The program was built for 1 devices`, root cause
-   `LLVM ERROR: VISA builder API call failed: CisaBuilder->Compile(...) / could not create output file:
-   Compiler error emitted in code generator`). `_grouped_mlp_prefill`'s `except` then latches
-   `_grouped_gemm_supported` off for that layer — permanently, and until now, silently. Every MoE prefill
-   therefore runs the eager loop: correct, but no P4-03 speedup.
-2. **Where it does build, it is wrong outside K=3/cb=1.** On K=4/cb=2 its gate/up disagree with the
-   certified `exl3_linear` path by 0.14-0.27 absolute (~15 % of the value) at every M in 1..8, including a
-   single row at offset 0 — so it is an arithmetic bug, not a row-layout one. End to end the routed output
-   is 17-28 % off the reference. It was only ever certified on K=3/cb=1.
+1. **JIT failure — fixed.** The SYCL JIT failed on the first multi-token call (`RuntimeError: The program was built for 1 devices`, root cause `LLVM ERROR: VISA builder API call failed … Compiler error emitted in code generator`), and `_grouped_mlp_prefill`'s `except` latched `_grouped_gemm_supported` off for that layer — permanently, silently. Root cause: the `MR=16` instantiations, whose accumulator is `16 × 4 × 2 × 32 = 4,096 floats = 16,384 B` — twice the 8 KB GRF, refused by the register allocator (`V4078`). Those instantiations are gone.
+2. **Numerics outside K=3/cb=1 — fixed.** The output was 17-28 % off the certified `exl3_linear` path at every M in 1..8, including a single row at offset 0 (arithmetic, not row layout). Two causes: `MR=8` sat exactly at the 8,192 B register limit and spilled the accumulator, and the split-K `part` stores were L1 write-back while `had_out` read past L1 with no clean fence, so cross-EU partials went stale. Fixed with `MR=4` (7,168 B of vector state) plus `cache_hint_L1<write_through>` on the `part` store and `fence<…, flush_op::clean>` before the split-K arrival. Verified by `tests/test_grouped_verify.py --strict`: **50/50**, worst relative error 1.8e-3 (T=64), T=4 effectively bit-exact.
+3. **Performance — open, and the current reason the path stays off.** The same commit pinned `MR = 4` and Python chunking to `max_m_target = 4`. At production prefill sizes each expert holds `cnt ≈ 128` rows (T=4096, top-8 over 256 experts), so each expert is split into **32 sub-units that each re-read that expert's full trellis** — 32× the weight traffic instead of 1× unchunked — while the eager loop amortizes the same weights across all 128 rows. Measured A/B, identical config and prompts, both paths proven by `EXL3_TRACE_PATHS`:
+
+   | prompt | P4-03 engaged | eager loop |
+   |---|---|---|
+   | ~13,000 tokens | 118.4 s → 111 tok/s | 26.1 s → **464 tok/s** |
+   | ~2,700-2,900 tokens | 25.7 s → 113 tok/s | 8.6 s → **307 tok/s** |
+
+   i.e. **2.7-4.6× slower than the loop it replaces** (≈900 vs ≈220 ms/layer at T=4096). Layer-0 numbers showing 1.9-3.1× wins cover only T ≤ 256, where `cnt ≤ 8` and the chunking creates at most two sub-units; the crossover lies between T=256 and T=4096. Re-tile rather than un-pin: `MR=4` is required for correctness at K=4 (§2 above), so the tile shape — not the constant — has to change.
 
 **What being down costs in prompt processing.** A/B on `--max-num-batched-tokens` alone: same card and
 checkpoint, identical `KV_CACHE_BYTES` (both legs report a 107,240-token KV cache) and `MAX_LEN=16384`,
@@ -158,16 +158,11 @@ compute floor **B ≈ 1.30 ms/token (≈ 770 tok/s)**, within ±15 % on the seco
 loop's host-op tax: ~257 syncs + ~1,280 kernel launches per layer per chunk = ~1,537 host ops at
 **~55 µs each** — the expected XPU launch/sync cost, which accounts for the per-chunk term arithmetically.
 
-So P4-03 being out of service costs **39 % of prefill time at `BATCHED_TOKENS=4096` — 472 tok/s today
-against an upper bound of ~770, i.e. ≈1.6× — and 84 % at `BATCHED_TOKENS=512`** (126 tok/s). It is an
-upper bound: part of A is vLLM scheduler / KV / attention fixed cost that P4-03 cannot touch, and none of
-it is recoverable until the two defects above are fixed — which is why P4-03 has to stay disabled for this
-K/cb rather than be re-enabled for the speed.
+So the eager loop wastes **39 % of prefill time at `BATCHED_TOKENS=4096`** (472 tok/s today vs a ~770 tok/s compute floor, i.e. ≈1.6× available) and **84 % at `BATCHED_TOKENS=512`** (126 tok/s). That is real — but note what it does *not* imply: the current P4-03 does not recover it (defect 3), because what it removes is the host-op term while tripling the weight-traffic term. The prize belongs to whatever replaces *both*.
 
-Fixing (1) alone would activate (2). Re-enabling P4-03 is gated on the parity suite passing for that
-checkpoint's K/cb; until then leave it latched, and don't "fix" the JIT failure in isolation. Practical
-corollary while it is down: keep `--max-num-batched-tokens` large — small chunks are disproportionately
-expensive (126 vs 473 tok/s on the same prompt).
+Practical corollary while it stays down: keep `--max-num-batched-tokens` large — small chunks are disproportionately expensive (126 vs 473 tok/s on the same prompt).
+
+**Fix direction, in order:** (a) gate P4-03 on `max(cnt) <= max_m_target` so it only runs when it doesn't need to chunk (it wins 2.26× at T=128); (b) remove the eager loop's per-expert `torch.unique` + `nonzero` syncs — `_HAS_MOE_C.remap_hidden_states` already yields `rows_per_expert`/offsets on device, so one `.tolist()` replaces ~256 of the 257 syncs, with no numerics risk and no kernel change; (c) re-tile `(MR, NT)` under the register budget (e.g. halve `NT` so MR=8's accumulator returns to 7,168 B) so `cnt/MR` sub-units shrink from 32 to 16.
 
 ### Tracing and testing MoE paths
 
@@ -186,8 +181,9 @@ The parity suites live with the serving integration in
 need a local EXL3 MoE checkpoint on disk):
 
 - `tests/test_grouped_verify.py` — T ∈ {2,3,4} × {bf16, fp16} × three routing patterns, bit-exact against
-  the per-row reference: **44/44**. `--strict` turns the P4-03 expected-fail row into a failure, which is
-  the gate for re-enabling prefill.
+  the per-row reference: **44/44**. Since `a46d417` removed the K/cb refusal, the six P4-03 rows are
+  genuinely exercised rather than reported "latched, not exercised", so `--strict` now passes
+  **50/50, exit 0** — i.e. the *numerics* gate is met; the unmet gate is performance (defect 3 above).
 - `tests/test_grouped_gemv.py` (P4-02, bit-exact), `tests/test_grouped_prefill.py` (P4-03),
   `tests/_moe_harness.py` (fixture loader).
 
@@ -297,9 +293,12 @@ images read back in order), video and a 128K needle test pass. Open items: 254K 
 (~80 TFLOPS fp16; int8 QK^T is the next step); at C16 with thinking on ~14 of 16 streams fit the KV pool.
 Log in `docs/PROGRESS.md`.
 
-MoE open items: prefill (T≥5) is served by the eager per-expert loop because P4-03 is blocked on two
-stacked defects — a SYCL JIT failure in the serving process, and numerics wrong for K=4/cb=2 — so
-unblocking it requires both a JIT fix *and* a parity pass for that checkpoint's K/cb (the parity suite has
-an expected-fail row for it). The MoE paths are validated on Arc 140V / vLLM 0.31.0 XPU with TP=1 and
-`enforce-eager`; they have not been re-run on the B70 / 0.26.1 recipe above, and tensor parallelism is
-still unsupported for MoE as for dense.
+MoE open items: P4-03's two original defects are **fixed** (`a46d417`: the `MR=16` GRF/JIT overflow and the
+K=4/cb=2 numerics — `tests/test_grouped_verify.py --strict` now passes 50/50 with the path genuinely
+exercised). A third defect was introduced by that fix and is the open one: pinning `MR = 4` splits each
+expert into `cnt/4` sub-units that re-read its trellis, so at production chunk sizes P4-03 runs
+**2.7–4.6× slower than the eager loop** (111 vs 464 tok/s, see "P4-03 prefill is deliberately not in
+service"). The `K/cb` refusal was removed by the same commit, so **the current tree runs P4-03 in
+serving** and should be re-gated until the tiling/host-op fix lands. The MoE paths are validated on
+Arc 140V / vLLM 0.31.0 XPU with TP=1 and `enforce-eager`; they have not been re-run on the B70 / 0.26.1
+recipe above, and tensor parallelism is still unsupported for MoE as for dense.
