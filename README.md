@@ -143,8 +143,31 @@ Two defects, stacked so the first hides the second:
    single row at offset 0 — so it is an arithmetic bug, not a row-layout one. End to end the routed output
    is 17-28 % off the reference. It was only ever certified on K=3/cb=1.
 
+**What being down costs in prompt processing.** A/B on `--max-num-batched-tokens` alone: same card and
+checkpoint, identical `KV_CACHE_BYTES` (both legs report a 107,240-token KV cache) and `MAX_LEN=16384`,
+one streamed token per request, unique random-word prompts so the prefix cache never hits:
+
+| prefill chunking | 14,299-token prompt | 3,149-token prompt |
+|---|---|---|
+| `BATCHED_TOKENS=4096` (3.5 / 1 chunks) | 30.25 s → **472.6 tok/s** | 8.42 s → 374.1 tok/s |
+| `BATCHED_TOKENS=512` (28 / 7 chunks) | 113.78 s → **125.7 tok/s** | 23.93 s → 131.6 tok/s |
+
+3.8× of prefill throughput from chunk size alone means the cost is per *chunk*, not per token. Fitting
+`TTFT = A × chunks + B × tokens` gives **A ≈ 3.3 s of fixed cost per chunk (≈ 84 ms per layer)** and a
+compute floor **B ≈ 1.30 ms/token (≈ 770 tok/s)**, within ±15 % on the second prompt. A is the eager
+loop's host-op tax: ~257 syncs + ~1,280 kernel launches per layer per chunk = ~1,537 host ops at
+**~55 µs each** — the expected XPU launch/sync cost, which accounts for the per-chunk term arithmetically.
+
+So P4-03 being out of service costs **39 % of prefill time at `BATCHED_TOKENS=4096` — 472 tok/s today
+against an upper bound of ~770, i.e. ≈1.6× — and 84 % at `BATCHED_TOKENS=512`** (126 tok/s). It is an
+upper bound: part of A is vLLM scheduler / KV / attention fixed cost that P4-03 cannot touch, and none of
+it is recoverable until the two defects above are fixed — which is why P4-03 has to stay disabled for this
+K/cb rather than be re-enabled for the speed.
+
 Fixing (1) alone would activate (2). Re-enabling P4-03 is gated on the parity suite passing for that
-checkpoint's K/cb; until then leave it latched, and don't "fix" the JIT failure in isolation.
+checkpoint's K/cb; until then leave it latched, and don't "fix" the JIT failure in isolation. Practical
+corollary while it is down: keep `--max-num-batched-tokens` large — small chunks are disproportionately
+expensive (126 vs 473 tok/s on the same prompt).
 
 ### Tracing and testing MoE paths
 
