@@ -1303,6 +1303,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         if getattr(self, "_grouped_gemm_supported", None) is False:
             return None
+        # P4-03 is certified only on (K=3, cb=1). On (K=4, cb=2), it has known
+        # numerical defects (§13.5) and a compiler JIT failure (§13.4).
+        if (self.K, self.cb) != (3, 1):
+            if not getattr(self, "_prefill_uncertified_logged", False):
+                self._prefill_uncertified_logged = True
+                _trace_path("prefill-uncertified", f" K={self.K} cb={self.cb}")
+                import warnings
+
+                warnings.warn(
+                    f"exl3: grouped prefill GEMM disabled for {self.prefix} "
+                    f"(K={self.K}, cb={self.cb} is uncertified; using certified eager prefill)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self._grouped_gemm_supported = False
+            return None
         if not hasattr(torch.ops.exl3xpu_C, "exl3_moe_grouped_gemm"):
             self._grouped_gemm_supported = False
             return None
