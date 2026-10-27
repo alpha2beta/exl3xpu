@@ -1303,22 +1303,6 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         if getattr(self, "_grouped_gemm_supported", None) is False:
             return None
-        # P4-03 is certified only on (K=3, cb=1). On (K=4, cb=2), it has known
-        # numerical defects (§13.5) and a compiler JIT failure (§13.4).
-        if (self.K, self.cb) != (3, 1):
-            if not getattr(self, "_prefill_uncertified_logged", False):
-                self._prefill_uncertified_logged = True
-                _trace_path("prefill-uncertified", f" K={self.K} cb={self.cb}")
-                import warnings
-
-                warnings.warn(
-                    f"exl3: grouped prefill GEMM disabled for {self.prefix} "
-                    f"(K={self.K}, cb={self.cb} is uncertified; using certified eager prefill)",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            self._grouped_gemm_supported = False
-            return None
         if not hasattr(torch.ops.exl3xpu_C, "exl3_moe_grouped_gemm"):
             self._grouped_gemm_supported = False
             return None
@@ -1403,35 +1387,31 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             shard13 = self._shard_of_nb(dev, inter)
             shard2 = self._shard_of_nb(dev, self.hidden_size)
 
-            # Vector tile selection (MR=8 or MR=16):
-            # For small T <= 8, counts <= 8 always holds: bypass host syncs (§11.4).
-            if T <= 8:
-                max_m_target = 8
-            else:
-                gt8_count = (counts > 8).sum().item()
-                max_m_target = 16 if (gt8_count > U // 2) else 8
-                if (counts > max_m_target).any():
-                    chunk_exp = []
-                    chunk_cnt = []
-                    chunk_off = []
-                    for exp, cnt, off in zip(
-                        active_experts.tolist(), counts.tolist(), offsets.tolist()
-                    ):
-                        while cnt > max_m_target:
-                            chunk_exp.append(exp)
-                            chunk_cnt.append(max_m_target)
-                            chunk_off.append(off)
-                            off += max_m_target
-                            cnt -= max_m_target
+            # Vector tile selection (MR=4 pinned for Xe2 GRF budget and bit-exactness):
+            # For small T <= 4, counts <= 4 always holds: bypass host syncs (§11.4).
+            max_m_target = 4
+            if T > 4 and (counts > max_m_target).any():
+                chunk_exp = []
+                chunk_cnt = []
+                chunk_off = []
+                for exp, cnt, off in zip(
+                    active_experts.tolist(), counts.tolist(), offsets.tolist()
+                ):
+                    while cnt > max_m_target:
                         chunk_exp.append(exp)
-                        chunk_cnt.append(cnt)
+                        chunk_cnt.append(max_m_target)
                         chunk_off.append(off)
-                    active_experts = torch.tensor(
-                        chunk_exp, dtype=torch.int32, device=dev
-                    )
-                    counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
-                    offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
-                    U = active_experts.shape[0]
+                        off += max_m_target
+                        cnt -= max_m_target
+                    chunk_exp.append(exp)
+                    chunk_cnt.append(cnt)
+                    chunk_off.append(off)
+                active_experts = torch.tensor(
+                    chunk_exp, dtype=torch.int32, device=dev
+                )
+                counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
+                offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
+                U = active_experts.shape[0]
 
             ids13 = active_experts.repeat_interleave(2)
             m13 = counts.repeat_interleave(2)
