@@ -72,6 +72,25 @@ except Exception:
 #: Projections every routed expert must provide in this checkpoint schema.
 CHECKPOINT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
+# One-shot per-path trace (EXL3_TRACE_PATHS=1) so a latched or unreachable
+# grouped path cannot stay silent — §11.8 G0 of mtp_moe.md.
+_PATH_SEEN: set[str] = set()
+_TRACE_PATHS: bool | None = None
+
+
+def _trace_path(name: str, detail: str = "") -> None:
+    global _TRACE_PATHS
+    if _TRACE_PATHS is None:
+        import os
+
+        _TRACE_PATHS = bool(os.environ.get("EXL3_TRACE_PATHS"))
+    if not _TRACE_PATHS or name in _PATH_SEEN:
+        return
+    _PATH_SEEN.add(name)
+    import sys
+
+    print(f"[exl3] path engaged: {name}{detail}", file=sys.stderr, flush=True)
+
 
 class Exl3MoEUnsupported(NotImplementedError):
     """The MoE layer cannot be served by EXL3.
@@ -1176,6 +1195,95 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         w = weights.view(-1).to(torch.float32).unsqueeze(1)
         return (dn.squeeze(1).to(torch.float32) * w).sum(dim=0).to(x1.dtype)
 
+    # -- §11.5: token-parallel grouped verify path (MTP verify 1 < T <= 4) -----
+    def _grouped_mlp_verify(
+        self,
+        layer: "RoutedExperts",
+        x2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Token-parallel grouped verify path for small T <= 4 (zero host sync).
+
+        Unit mapping (§11.5): ``ids = topk_ids.reshape(-1)`` is token-major, so
+        gate+up uses ``nslots=2`` with ``expert_ids = ids.repeat_interleave(2)``
+        (unit ``u`` -> expert ``ids[u // 2]``, slot ``u % 2``) and a per-unit
+        ``x_unit_stride`` fed by ``x2.repeat_interleave(2 * k)``, which maps unit
+        ``u`` to token ``u // (2k)``.  Down consumes ``ids`` directly with
+        ``x_unit_stride=inter``.  The weighted reduction is fp32 and sums the k
+        slots in token-major order, matching P4-02's decode reduction.
+
+        The failure latch deliberately writes ``_verify_supported`` only — a
+        verify-only problem (shape, dtype, unsupported K/codebook) must never
+        disable ``_grouped_supported``, i.e. the certified P4-02 decode path
+        (§11.6).  Returns ``None`` when latched so ``apply()`` falls through to
+        the P4-03 / eager multi-token paths.
+        """
+        import torch.nn.functional as F
+
+        if getattr(self, "_verify_supported", None) is False:
+            return None
+        if not hasattr(torch.ops.exl3xpu_C, "exl3_moe_grouped_gemv"):
+            self._latch_verify("exl3_moe_grouped_gemv op is not registered")
+            return None
+        try:
+            T, k = topk_ids.shape
+            dev = x2.device
+            inter = self.intermediate_size_per_partition
+            ids = topk_ids.reshape(-1).to(torch.int32)
+
+            # gate+up: repeat each token row 2*k times so unit u gets token u // (2k)
+            x_rep = x2.repeat_interleave(2 * k, dim=0)
+            gu = torch.ops.exl3xpu_C.exl3_moe_grouped_gemv(
+                x_rep,
+                layer.w13_trellis,
+                layer.w13_suh,
+                layer.w13_svh,
+                ids.repeat_interleave(2),
+                self._shard_of_nb(dev, inter),
+                2,
+                inter,
+                self.K,
+                self.cb,
+                self.hidden_size,
+            )
+            acts = (F.silu(gu[0::2]) * gu[1::2]).reshape(-1, inter).contiguous()
+            dn = torch.ops.exl3xpu_C.exl3_moe_grouped_gemv(
+                acts,
+                layer.w2_trellis,
+                layer.w2_suh,
+                layer.w2_svh,
+                ids,
+                self._shard_of_nb(dev, self.hidden_size),
+                1,
+                self.hidden_size,
+                self.K,
+                self.cb,
+                inter,
+            )
+            w = weights.reshape(-1).to(torch.float32).unsqueeze(1)
+            y = (dn.squeeze(1).to(torch.float32) * w).view(T, k, -1).sum(dim=1)
+            return y.to(x2.dtype)
+        except Exception as exc:
+            # Latch this path only: the eager / P4-03 fallbacks below stay
+            # correct, and P4-02 decode keeps serving this layer.
+            self._latch_verify(f"{type(exc).__name__}: {exc}")
+            return None
+
+    def _latch_verify(self, reason: str) -> None:
+        """Disable the §11.5 verify path for this layer, reporting it once."""
+        self._verify_supported = False
+        if getattr(self, "_verify_latch_logged", False):
+            return
+        self._verify_latch_logged = True
+        import warnings
+
+        warnings.warn(
+            f"exl3: grouped verify path disabled for {self.prefix}: {reason}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     # -- P4-03: grouped small-M prefill path ----------------------------------
     def _grouped_mlp_prefill(
         self,
@@ -1280,33 +1388,34 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             shard2 = self._shard_of_nb(dev, self.hidden_size)
 
             # Vector tile selection (MR=8 or MR=16):
-            # For Arc 140V (8 Xe2 cores, 64 Vector Engines), MR=8 provides twice
-            # the concurrent thread occupancy per subslice. Only switch to MR=16
-            # when the majority of active experts have >8 tokens (T >= 512).
-            gt8_count = (counts > 8).sum().item()
-            max_m_target = 16 if (gt8_count > U // 2) else 8
-            if (counts > max_m_target).any():
-                chunk_exp = []
-                chunk_cnt = []
-                chunk_off = []
-                for exp, cnt, off in zip(
-                    active_experts.tolist(), counts.tolist(), offsets.tolist()
-                ):
-                    while cnt > max_m_target:
+            # For small T <= 8, counts <= 8 always holds: bypass host syncs (§11.4).
+            if T <= 8:
+                max_m_target = 8
+            else:
+                gt8_count = (counts > 8).sum().item()
+                max_m_target = 16 if (gt8_count > U // 2) else 8
+                if (counts > max_m_target).any():
+                    chunk_exp = []
+                    chunk_cnt = []
+                    chunk_off = []
+                    for exp, cnt, off in zip(
+                        active_experts.tolist(), counts.tolist(), offsets.tolist()
+                    ):
+                        while cnt > max_m_target:
+                            chunk_exp.append(exp)
+                            chunk_cnt.append(max_m_target)
+                            chunk_off.append(off)
+                            off += max_m_target
+                            cnt -= max_m_target
                         chunk_exp.append(exp)
-                        chunk_cnt.append(max_m_target)
+                        chunk_cnt.append(cnt)
                         chunk_off.append(off)
-                        off += max_m_target
-                        cnt -= max_m_target
-                    chunk_exp.append(exp)
-                    chunk_cnt.append(cnt)
-                    chunk_off.append(off)
-                active_experts = torch.tensor(
-                    chunk_exp, dtype=torch.int32, device=dev
-                )
-                counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
-                offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
-                U = active_experts.shape[0]
+                    active_experts = torch.tensor(
+                        chunk_exp, dtype=torch.int32, device=dev
+                    )
+                    counts = torch.tensor(chunk_cnt, dtype=torch.int32, device=dev)
+                    offsets = torch.tensor(chunk_off, dtype=torch.int32, device=dev)
+                    U = active_experts.shape[0]
 
             ids13 = active_experts.repeat_interleave(2)
             m13 = counts.repeat_interleave(2)
@@ -1368,7 +1477,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     dn.to(torch.float32) * sorted_weights.unsqueeze(-1),
                 )
                 return out.to(x2.dtype)
-        except Exception:
+        except Exception as exc:
+            _trace_path("prefill-latched", f" {type(exc).__name__}: {exc}")
             self._grouped_gemm_supported = False
             return None
 
@@ -1463,6 +1573,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             # the P4-01 loop when the grouped op is unavailable.
             y = self._grouped_mlp_decode(layer, x2, topk_ids, weights)
             if y is not None:
+                _trace_path("decode", f" tokens={tokens}")
                 return y.reshape(x.shape)
             # One host sync for the routing decision; every expert handle is a
             # zero-copy cache view, so there are no further syncs.
@@ -1473,13 +1584,25 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 out += y.to(torch.float32) * wt
             return out.to(x2.dtype).reshape(x.shape)
 
+        if self._debug_capture is None and 1 < tokens <= 4:
+            # --- §11.5 token-parallel grouped verify fast path (MTP) -----------
+            y = self._grouped_mlp_verify(layer, x2, topk_ids, weights)
+            if y is not None:
+                _trace_path("verify", f" tokens={tokens}")
+                return y.reshape(x.shape)
+
         if self._debug_capture is None and tokens > 1:
             # --- P4-03 grouped prefill fast path ------------------------------
             y = self._grouped_mlp_prefill(layer, x2, topk_ids, weights)
             if y is not None:
+                _trace_path("prefill-gemm", f" tokens={tokens}")
                 return y.reshape(x.shape)
 
         # --- general (prefill / multi-token) fallback path ------------------
+        _trace_path(
+            "eager-fallback",
+            f" tokens={tokens} debug_capture={self._debug_capture is not None}",
+        )
         if self._debug_capture is not None and topk_ids.numel():
             # Range validation is a device->host sync; keep it on the debug
             # path only (the arena shape is asserted once at load time).
